@@ -25,7 +25,7 @@ binding = "AI"
 # Stores OAuth tokens and dynamic client registrations for the /mcp endpoint.
 [[kv_namespaces]]
 binding = "OAUTH_KV"
-id = ""
+id = "d534b75604004e7b893ea85543938b50"
 # Create manually: wrangler kv namespace create OAUTH_KV
 # then paste the returned id above.
 
