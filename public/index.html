@@ -978,6 +978,29 @@
         font-weight: 500;
       }
 
+      .vec-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 11px;
+        padding: 3px 8px;
+        border-radius: var(--radius-tag);
+        white-space: nowrap;
+      }
+      .vec-chip--on {
+        background: var(--accent-soft);
+        color: var(--accent-ink);
+      }
+      .vec-chip--pending {
+        background: var(--surface-2);
+        color: var(--text-tag);
+      }
+      .vec-chip--off {
+        background: color-mix(in srgb, var(--danger) 15%, transparent);
+        color: var(--danger);
+        font-weight: 500;
+      }
+
       .match-line {
         display: flex;
         align-items: center;
@@ -2468,6 +2491,7 @@
           </div>
         </div>
         <div class="digest-section" id="digest-section" style="display:none"></div>
+        <div class="digest-section" id="vectorize-section" style="display:none"></div>
         <div class="theme-row">
           <span class="theme-row-label">Appearance</span>
           <div class="theme-toggle" id="theme-toggle">
@@ -2503,6 +2527,7 @@
         selectedTag = '',
         selectedTimeRange = ''
       let currentCount = 0
+      let vectorizeGraceMs = 300000
 
       function init() {
         applyTheme()
@@ -2711,12 +2736,21 @@
         const loadingEl = appendLoading(msgs)
         msgs.scrollTop = msgs.scrollHeight
         try {
-          const result = await apiMcp('recall', { query, topK: 5, ...(selectedTag ? { tag: selectedTag } : {}) })
+          // Use the REST endpoint for structured results — parsing the MCP tool's
+          // formatted text miscounts sources when memory content contains list items
+          const params = new URLSearchParams({ query, topK: '5' })
+          if (selectedTag) params.set('tag', selectedTag)
+          const recallRes = await fetch(`${WORKER_URL}/recall?${params}`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
+          const data = await recallRes.json()
+          // Server/auth errors must not render as "no results" — let the catch handle them
+          if (!recallRes.ok || !data.ok) throw new Error(data.error || 'recall failed')
           loadingEl.remove()
-          if (!result || result.includes('Nothing found')) {
+          if (!data.results || !data.results.length) {
             appendBrainBubble(msgs, "I couldn't find anything matching that. Try different words, or check Recent.", 'recall-sys')
           } else {
-            const entries = parseRecallResult(result)
+            // REST scores are already 0–100 (one decimal); map directly rather than via
+            // normalizeEntry, whose 0–1 rescale heuristic would turn a 0.8% match into 80%
+            const entries = data.results.map((m) => ({ id: m.id, content: m.content, tags: m.tags || [], score: Math.min(100, Math.round(m.score)) }))
             const answerBubble = document.createElement('div')
             answerBubble.className = 'ex-a-row'
             const answerEl = document.createElement('div')
@@ -2724,10 +2758,20 @@
             answerBubble.appendChild(answerEl)
             msgs.appendChild(answerBubble)
 
+            // Serialize results for the /chat LLM context, mirroring the MCP tool's
+            // format — dates/tags/source are needed for temporal questions
+            const memories =
+              (data.insight ? `Insight: ${data.insight}\n\n` : '') +
+              data.results.map((m, i) => {
+                const date = new Date(m.created_at).toLocaleDateString()
+                const tagList = m.tags && m.tags.length ? ` [${m.tags.join(', ')}]` : ''
+                const src = m.source ? ` · ${m.source}` : ''
+                return `${i + 1}. [${date}${src}${tagList}] (${Math.min(100, Math.round(m.score))}% match)${m.updated ? ' [updated]' : ''}\n${m.content}`
+              }).join('\n\n')
             const res = await fetch(`${WORKER_URL}/chat`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AUTH_TOKEN}` },
-              body: JSON.stringify({ query, memories: result }),
+              body: JSON.stringify({ query, memories }),
             })
 
             const reader = res.body.getReader()
@@ -2888,19 +2932,33 @@
         } catch {}
         const isSynthesized = tags.includes('synthesized')
         const isRolledUp = tags.includes('rolled-up')
+
+        let vectorIds = []
+        try { vectorIds = JSON.parse(entry.vector_ids || '[]') } catch {}
+        const vectorized = vectorIds.length > 0
+        // Pending state is computed at render time; won't auto-flip — reload required
+        const pending = !vectorized && (Date.now() - (entry.created_at || 0) < vectorizeGraceMs)
+        const vec = vectorized ? 'on' : (pending ? 'pending' : 'off')
+
+        const vecChip = vec === 'on'
+          ? `<span class="tag-chip vec-chip vec-chip--on" title="Vectorized — searchable via recall"><i class="ti ti-circle-check"></i></span>`
+          : vec === 'pending'
+          ? `<span class="tag-chip vec-chip vec-chip--pending" title="Vectorizing… (just captured)"><i class="ti ti-clock"></i></span>`
+          : `<span class="tag-chip vec-chip vec-chip--off" title="Not vectorized — won't appear in recall">Not indexed</span>`
+
         const card = document.createElement('div')
         card.className = 'memory-card' + (isSynthesized ? ' card--synthesized' : '') + (isRolledUp ? ' card--rolled-up' : '')
         card.dataset.id = entry.id
         card.innerHTML = `
-    <div class="card-content" style="cursor: pointer;">${escHtml(entry.content)}</div>
-    <div class="card-footer">
-      <div class="card-tags">${tags.map((t) => `<span class="tag-chip${t === 'synthesized' ? ' tag-chip--synthesized' : ''}">${escHtml(t)}</span>`).join('')}</div>
-      <div class="card-actions">
-        <button class="card-action-btn" onclick="openAppend('${escAttr(entry.id)}', '${escAttr(entry.content.slice(0, 80))}')"><i class="ti ti-writing"></i> Append</button>
-        <button class="card-action-btn edit-btn"><i class="ti ti-pencil"></i> Edit</button>
-        <button class="card-action-btn" onclick="openConfirm('${escAttr(entry.id)}', this)"><i class="ti ti-x"></i> Forget</button>
-      </div>
-    </div>`
+<div class="card-content" style="cursor: pointer;">${escHtml(entry.content)}</div>
+<div class="card-footer">
+  <div class="card-tags">${tags.map((t) => `<span class="tag-chip${t === 'synthesized' ? ' tag-chip--synthesized' : ''}">${escHtml(t)}</span>`).join('')}${vecChip}</div>
+  <div class="card-actions">
+    <button class="card-action-btn" onclick="openAppend('${escAttr(entry.id)}', '${escAttr(entry.content.slice(0, 80))}')"><i class="ti ti-writing"></i> Append</button>
+    <button class="card-action-btn edit-btn"><i class="ti ti-pencil"></i> Edit</button>
+    <button class="card-action-btn" onclick="openConfirm('${escAttr(entry.id)}', this)"><i class="ti ti-x"></i> Forget</button>
+  </div>
+</div>`
         card.querySelector('.card-content').onclick = () => openView({ id: entry.id, content: entry.content, tags }, card)
         card.querySelector('.edit-btn').onclick = () => openEdit(entry.id, entry.content, tags)
         return card
@@ -3090,7 +3148,9 @@
           tagsEl.innerHTML = data.top_tags?.length
             ? data.top_tags.map((t) => `<span class="tag-chip">${escHtml(t)}</span>`).join('')
             : '<span style="font-size:13px;color:var(--text-tertiary)">No tags yet</span>'
+          vectorizeGraceMs = data.vectorize_grace_ms ?? vectorizeGraceMs
           renderDigestSection(data.digest_candidates ?? [])
+          renderVectorizeSection(data.unvectorized ?? 0)
         } catch {}
       }
 
@@ -3147,6 +3207,52 @@
           setTimeout(() => {
             btn.disabled = false
             btn.innerHTML = 'Digest →'
+            btn.style.color = ''
+          }, 3000)
+        }
+      }
+
+      function renderVectorizeSection(count) {
+        const el = document.getElementById('vectorize-section')
+        if (!count) { el.style.display = 'none'; return }
+        el.style.display = ''
+        el.innerHTML = `
+          <div class="digest-section-label">Not indexed</div>
+          <p class="digest-note">${count} ${count === 1 ? 'memory' : 'memories'} failed to embed and won't appear in recall.</p>
+          <button class="digest-btn" id="vectorize-btn" onclick="runVectorize(this)">Vectorize now →</button>
+        `
+      }
+
+      async function runVectorize(btn) {
+        btn.disabled = true
+        btn.classList.add('digest-btn--loading')
+        btn.innerHTML = '<i class="ti ti-loader-2"></i> Working…'
+        try {
+          let remaining = 1
+          let totalProcessed = 0
+          while (remaining > 0) {
+            const res = await fetch(`${WORKER_URL}/vectorize-pending`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${AUTH_TOKEN}` }
+            })
+            if (!res.ok) throw new Error(`Server error: ${res.status}`)
+            const data = await res.json()
+            remaining = data.remaining ?? 0
+            totalProcessed += data.processed ?? 0
+            if ((data.processed ?? 0) === 0 && remaining > 0) break
+          }
+          btn.classList.remove('digest-btn--loading')
+          btn.innerHTML = `<i class="ti ti-check"></i> Done — ${totalProcessed} re-indexed`
+          btn.style.color = 'var(--good)'
+          await loadMenuStats()
+          loadRecent()
+        } catch {
+          btn.classList.remove('digest-btn--loading')
+          btn.innerHTML = '<i class="ti ti-wifi-off"></i> Request failed'
+          btn.style.color = 'var(--danger)'
+          setTimeout(() => {
+            btn.disabled = false
+            btn.innerHTML = 'Vectorize now →'
             btn.style.color = ''
           }, 3000)
         }

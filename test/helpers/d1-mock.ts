@@ -1,3 +1,5 @@
+import { COMPRESSION_IMPORTANCE_THRESHOLD, COMPRESSION_MIN_RECALL } from "../../src/index";
+
 export class D1Mock {
   entries: any[] = [];
 
@@ -9,7 +11,7 @@ export class D1Mock {
       async run() {
         if (s.startsWith("INSERT INTO entries")) {
           const [id, content, tags, source, created_at, vector_ids] = args;
-          db.entries.push({ id, content, tags, source, created_at, vector_ids, recall_count: 0, importance_score: 0 });
+          db.entries.push({ id, content, tags, source, created_at, vector_ids, recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0 });
           return { meta: { changes: 1 } };
         }
         if (s.startsWith("UPDATE entries SET content = ?, vector_ids")) {
@@ -18,10 +20,22 @@ export class D1Mock {
           if (row) { row.content = content; row.vector_ids = vector_ids; }
           return { meta: { changes: row ? 1 : 0 } };
         }
+        if (s.startsWith("UPDATE entries SET tags = ?, vector_ids")) {
+          const [tags, vector_ids, id] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row) { row.tags = tags; row.vector_ids = vector_ids; }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("UPDATE entries SET vector_ids")) {
           const [vector_ids, id] = args;
           const row = db.entries.find((e: any) => e.id === id);
           if (row) row.vector_ids = vector_ids;
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET tags = ? WHERE id")) {
+          const [tags, id] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row) row.tags = tags;
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET content = ?, tags")) {
@@ -57,6 +71,18 @@ export class D1Mock {
           }
           return { meta: { changes: row ? 1 : 0 } };
         }
+        if (s.startsWith("UPDATE entries SET contradiction_wins = contradiction_wins + 1")) {
+          const [id] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row) row.contradiction_wins = (row.contradiction_wins ?? 0) + 1;
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET contradiction_losses = contradiction_losses + 1")) {
+          const [id] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row) row.contradiction_losses = (row.contradiction_losses ?? 0) + 1;
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("UPDATE entries SET recall_count")) {
           const [id] = args;
           const row = db.entries.find((e: any) => e.id === id);
@@ -88,7 +114,16 @@ export class D1Mock {
           const avg_importance = scored.length > 0
             ? scored.reduce((sum: number, e: any) => sum + e.importance_score, 0) / scored.length
             : null;
-          return { count, avg_importance };
+          const cutoff = args.length > 0 ? Number(args[0]) : undefined;
+          const unvectorized = cutoff !== undefined
+            ? db.entries.filter((e: any) => e.vector_ids === '[]' && e.created_at < cutoff).length
+            : 0;
+          return { count, avg_importance, unvectorized };
+        }
+        if (s.includes("COUNT(*) as count") && s.includes("vector_ids = '[]'") && s.includes("created_at <")) {
+          const cutoff = Number(args[0]);
+          const count = db.entries.filter((e: any) => e.vector_ids === '[]' && e.created_at < cutoff).length;
+          return { count };
         }
         if (s.includes("COUNT(*) as count")) {
           return { count: db.entries.length };
@@ -116,18 +151,18 @@ export class D1Mock {
         return null;
       },
       async all() {
-        if (s === "SELECT id FROM entries WHERE tags LIKE ?") {
+        if (s === "SELECT id FROM entries WHERE tags LIKE ?" || s === "SELECT id, vector_ids FROM entries WHERE tags LIKE ?") {
           const pattern = String(args[0]);
           const tag = pattern.replace(/%"/g, "").replace(/"%/g, "");
           const results = db.entries
             .filter((e: any) => (JSON.parse(e.tags ?? "[]") as string[]).includes(tag))
-            .map((e: any) => ({ id: e.id }));
+            .map((e: any) => ({ id: e.id, vector_ids: e.vector_ids ?? "[]" }));
           return { results };
         }
-        if (s.includes("SELECT id, recall_count, importance_score FROM entries")) {
+        if (s.includes("SELECT id, recall_count, importance_score") && s.includes("WHERE id IN")) {
           const results = db.entries
             .filter((e: any) => args.includes(e.id))
-            .map((e: any) => ({ id: e.id, recall_count: e.recall_count ?? 0, importance_score: e.importance_score ?? 0 }));
+            .map((e: any) => ({ id: e.id, recall_count: e.recall_count ?? 0, importance_score: e.importance_score ?? 0, contradiction_wins: e.contradiction_wins ?? 0, contradiction_losses: e.contradiction_losses ?? 0 }));
           return { results };
         }
         if (s.includes("FROM entries WHERE id IN") && s.includes("tags NOT LIKE")) {
@@ -137,9 +172,15 @@ export class D1Mock {
           const ids = args.slice(0, idCount);
           const rest = args.slice(idCount);
           let argIdx = 0;
-          let rows = db.entries.filter((e: any) =>
-            ids.includes(e.id) && !(JSON.parse(e.tags ?? "[]") as string[]).includes("auto-pattern")
-          );
+          const kindMatch = s.match(/tags LIKE '%"(kind:(?:episodic|semantic))"%'/);
+          let rows = db.entries.filter((e: any) => {
+            const tags: string[] = JSON.parse(e.tags ?? "[]");
+            if (!ids.includes(e.id)) return false;
+            if (tags.includes("auto-pattern")) return false;
+            if (s.includes('"status:deprecated"') && tags.includes("status:deprecated")) return false;
+            if (kindMatch && !tags.includes(kindMatch[1])) return false;
+            return true;
+          });
           if (s.includes("created_at >= ?")) {
             const after = Number(rest[argIdx++]);
             rows = rows.filter((e: any) => e.created_at >= after);
@@ -152,19 +193,21 @@ export class D1Mock {
           return { results };
         }
         if (s.includes("SELECT id, content FROM entries") && s.includes("WHERE tags LIKE") && s.includes("ORDER BY created_at DESC")) {
-          // compressTag raw entries query — filter by tag, exclude system tags and high importance
+          // compressTag raw entries query — tag match, system-tag exclusion, and the
+          // recall/age/contradiction eligibility predicate (cutoff is the 2nd bind param).
           const tagPattern = args[0] as string;
           const tag = tagPattern.replace(/%"/g, "").replace(/"%/g, "");
+          const cutoff = Number(args[1]);
           const results = [...db.entries]
             .filter((e: any) => {
               const tags: string[] = JSON.parse(e.tags ?? "[]");
-              return (
-                tags.includes(tag) &&
-                !tags.includes("synthesized") &&
-                !tags.includes("auto-pattern") &&
-                !tags.includes("rolled-up") &&
-                (e.importance_score == null || e.importance_score < 4)
-              );
+              if (!tags.includes(tag)) return false;
+              if (tags.includes("synthesized") || tags.includes("auto-pattern") || tags.includes("rolled-up")) return false;
+              if (!(e.importance_score == null || e.importance_score < COMPRESSION_IMPORTANCE_THRESHOLD)) return false;
+              const rc = e.recall_count; // NULL/undefined → recall clause is falsy → protected (matches SQL)
+              if (!(rc === 0 || (rc < COMPRESSION_MIN_RECALL && e.created_at < cutoff))) return false;
+              if (!(e.contradiction_wins == null || e.contradiction_wins === 0)) return false;
+              return true;
             })
             .sort((a: any, b: any) => b.created_at - a.created_at)
             .slice(0, 50)
@@ -175,6 +218,31 @@ export class D1Mock {
           const results = db.entries
             .filter((e: any) => args.includes(e.id))
             .map((e: any) => ({ id: e.id, content: e.content }));
+          return { results };
+        }
+        if (s.includes("json_each(entries.tags)") && s.includes("HAVING count > 10")) {
+          // Digest-candidate query (nightly compression + /stats): per-tag count of
+          // entries that pass the compression eligibility predicate. Cutoff is args[0].
+          const cutoff = Number(args[0]);
+          const SYSTEM = ["synthesized", "auto-pattern", "duplicate-candidate", "contradiction-resolved", "rolled-up"];
+          const counts = new Map<string, number>();
+          for (const e of db.entries as any[]) {
+            const tags: string[] = JSON.parse(e.tags ?? "[]");
+            if (tags.includes("rolled-up") || tags.includes("synthesized") || tags.includes("auto-pattern")) continue;
+            if (!(e.importance_score == null || e.importance_score < COMPRESSION_IMPORTANCE_THRESHOLD)) continue;
+            const rc = e.recall_count; // NULL/undefined → recall clause is falsy → protected (matches SQL)
+            if (!(rc === 0 || (rc < COMPRESSION_MIN_RECALL && e.created_at < cutoff))) continue;
+            if (!(e.contradiction_wins == null || e.contradiction_wins === 0)) continue;
+            for (const t of tags) {
+              if (SYSTEM.includes(t)) continue;
+              if (t.startsWith("status:") || t.startsWith("kind:")) continue;
+              counts.set(t, (counts.get(t) ?? 0) + 1);
+            }
+          }
+          const results = [...counts.entries()]
+            .filter(([, c]) => c > 10)
+            .sort((a, b) => b[1] - a[1])
+            .map(([tag, count]) => ({ tag, count }));
           return { results };
         }
         if (s.includes("json_each(entries.tags)") && s.includes("GROUP BY value")) {
@@ -193,6 +261,17 @@ export class D1Mock {
             (JSON.parse(e.tags ?? "[]") as string[]).forEach(t => tags.add(t));
           });
           return { results: [...tags].sort().map(t => ({ value: t })) };
+        }
+        if (s.includes("vector_ids = '[]' AND created_at <") && s.includes("ORDER BY created_at DESC LIMIT")) {
+          const cutoff = Number(args[0]);
+          const limitMatch = s.match(/LIMIT\s+(\d+)/i);
+          const limit = limitMatch ? parseInt(limitMatch[1], 10) : 25;
+          const rows = [...db.entries]
+            .filter((e: any) => e.vector_ids === '[]' && e.created_at < cutoff)
+            .sort((a: any, b: any) => b.created_at - a.created_at)
+            .slice(0, limit)
+            .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
+          return { results: rows };
         }
         if (s.includes("ORDER BY created_at DESC LIMIT")) {
           const limit = Number(args[args.length - 1]);

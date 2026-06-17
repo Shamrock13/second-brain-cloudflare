@@ -14,6 +14,7 @@ export interface Env {
   AI: Ai;
   AUTH_TOKEN: string;
   OAUTH_KV: KVNamespace;
+  VECTORIZE_GRACE_MS?: string;
 }
 
 const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
@@ -26,11 +27,38 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
 };
 
+function graceMs(env: Env): number {
+  return parseInt(env.VECTORIZE_GRACE_MS ?? "300000", 10) || 300000;
+}
+
 // ─── Thresholds ───────────────────────────────────────────────────────────────
 
 const DUPLICATE_BLOCK_THRESHOLD = 0.95;
 const DUPLICATE_FLAG_THRESHOLD = 0.85;
 const CANDIDATE_SCORE_THRESHOLD = 0.45;
+const TAG_BOOST_STEP = 0.15;
+const TAG_BOOST_MAX = 1.5;
+// Each net contradiction (win or loss) shifts a memory's effective importance by
+// log1p(|net|) * this step, clamped to the [1,5] importance band. Tunable.
+const CONTRADICTION_IMPORTANCE_STEP = 1.0;
+
+// ─── Compression eligibility ──────────────────────────────────────────────────
+// An entry is eligible for nightly digest compression only if it's low-importance,
+// not proven-useful by recall, and not a contradiction survivor. Strictly more
+// protective than the old `importance_score < 4` filter — it can only exempt MORE.
+export const COMPRESSION_IMPORTANCE_THRESHOLD = 4;   // importance >= this → protected
+export const COMPRESSION_MIN_RECALL = 2;             // recalled >= this many times → protected
+export const COMPRESSION_MIN_AGE_MS = 60 * 86400000; // entries with fewer than COMPRESSION_MIN_RECALL recalls protected until this old (60 days)
+
+// Returns a SQL boolean fragment for "this entry is eligible for compression".
+// Contains exactly one `?` placeholder — bind `Date.now() - COMPRESSION_MIN_AGE_MS`.
+// columnPrefix: "" for bare columns (compressTag), "entries." for json_each-joined queries.
+export function compressionEligibilitySql(columnPrefix = ""): string {
+  const p = columnPrefix;
+  return `(${p}importance_score IS NULL OR ${p}importance_score < ${COMPRESSION_IMPORTANCE_THRESHOLD})
+      AND (${p}recall_count = 0 OR (${p}recall_count < ${COMPRESSION_MIN_RECALL} AND ${p}created_at < ?))
+      AND (${p}contradiction_wins IS NULL OR ${p}contradiction_wins = 0)`;
+}
 
 // ─── Model constants ──────────────────────────────────────────────────────────
 
@@ -43,6 +71,7 @@ const CHUNK_OVERLAP_CHARS = 200;
 
 // ─── Token limits ─────────────────────────────────────────────────────────────
 
+const CLASSIFY_MAX_TOKENS = 80;
 const CONTRADICTION_MAX_TOKENS = 80;
 const SMART_MERGE_MAX_TOKENS = 250;
 const INSIGHT_MAX_TOKENS = 300;
@@ -52,6 +81,51 @@ const DIGEST_MAX_TOKENS = 400;
 // ─── Vectorize constants ──────────────────────────────────────────────────────
 
 const VECTORIZE_TOP_K_MULTIPLIER = 3;
+// getByIds batch size for tag-scoped recall — Vectorize rejects more than 20 IDs
+// per call (VECTOR_GET_ERROR, code 40007)
+const VECTORIZE_GET_BY_IDS_BATCH = 20;
+// D1 allows at most 100 bound parameters per query
+const D1_MAX_BOUND_PARAMS = 100;
+
+// ─── Memory status layer (issue #119) ──────────────────────────────────────────
+// Status lives as a reserved tag (e.g. "status:canonical") on entries.tags — no
+// schema change. Absent status = unspecified = default behavior.
+
+export const STATUS_VALUES = ["canonical", "draft", "deprecated"] as const;
+export type MemoryStatus = (typeof STATUS_VALUES)[number];
+const STATUS_PREFIX = "status:";
+
+export function getStatus(tags: string[]): MemoryStatus | null {
+  const tag = tags.find(t => t.startsWith(STATUS_PREFIX));
+  if (!tag) return null;
+  const value = tag.slice(STATUS_PREFIX.length) as MemoryStatus;
+  return (STATUS_VALUES as readonly string[]).includes(value) ? value : null;
+}
+
+export function withStatus(tags: string[], status: MemoryStatus): string[] {
+  const cleaned = tags.filter(t => !t.startsWith(STATUS_PREFIX));
+  return [...cleaned, `${STATUS_PREFIX}${status}`];
+}
+
+// ─── Memory kind layer (issue #12) ──────────────────────────────────────────────
+// Kind lives as a reserved tag (e.g. "kind:episodic") on entries.tags — no schema
+// change. Absent kind = unknown (unclassified). Orthogonal to status (#119).
+
+export const KIND_VALUES = ["episodic", "semantic"] as const;
+export type MemoryKind = (typeof KIND_VALUES)[number];
+const KIND_PREFIX = "kind:";
+
+export function getKind(tags: string[]): MemoryKind | null {
+  const tag = tags.find(t => t.startsWith(KIND_PREFIX));
+  if (!tag) return null;
+  const value = tag.slice(KIND_PREFIX.length) as MemoryKind;
+  return (KIND_VALUES as readonly string[]).includes(value) ? value : null;
+}
+
+export function withKind(tags: string[], kind: MemoryKind): string[] {
+  const cleaned = tags.filter(t => !t.startsWith(KIND_PREFIX));
+  return [...cleaned, `${KIND_PREFIX}${kind}`];
+}
 
 // ─── Runtime state ────────────────────────────────────────────────────────────
 
@@ -170,6 +244,8 @@ async function initializeDatabase(env: Env): Promise<void> {
   for (const alter of [
     `ALTER TABLE entries ADD COLUMN recall_count INTEGER DEFAULT 0`,
     `ALTER TABLE entries ADD COLUMN importance_score INTEGER DEFAULT 0`,
+    `ALTER TABLE entries ADD COLUMN contradiction_wins INTEGER DEFAULT 0`,
+    `ALTER TABLE entries ADD COLUMN contradiction_losses INTEGER DEFAULT 0`,
   ]) {
     try { await env.DB.exec(alter); } catch { /* column already exists — no-op */ }
   }
@@ -384,10 +460,27 @@ export function getHalfLifeMs(tags: string[]): number {
   return 30 * 24 * 60 * 60 * 1000; // 30 days default
 }
 
+// Cosine similarity between two vectors. BGE embeddings are not normalized,
+// so the denominator matters — this keeps tag-path scores on the same scale
+// as Vectorize's cosine query scores.
+export function cosineSim(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  // Guard on the raw norms, not the sqrt product — the product can underflow to 0
+  return normA === 0 || normB === 0 ? 0 : dot / Math.sqrt(normA * normB);
+}
+
 export function rerankWithTimeDecay(
   matches: VectorizeMatch[],
   recallCounts: Map<string, number> = new Map(),
-  importanceScores: Map<string, number> = new Map()
+  importanceScores: Map<string, number> = new Map(),
+  queryTags: string[] = [],
+  contradictionWins: Map<string, number> = new Map(),
+  contradictionLosses: Map<string, number> = new Map()
 ): VectorizeMatch[] {
   const now = Date.now();
 
@@ -411,12 +504,30 @@ export function rerankWithTimeDecay(
       const appendPenalty = isShortAppend ? 0.2 : 1.0;
       const rolledUpPenalty = tags.includes("rolled-up") ? 0.4 : 1.0;
 
-      // importance_score 0 = unscored (neutral). 1–5 scales from 0.88 → 1.20.
-      // Lets high-importance memories surface above the recency cap without dominating.
+      // Effective importance = classifier score adjusted by net contradiction history.
+      // Survivors (net wins) rise toward 5; repeatedly-contradicted memories (net losses)
+      // fall toward 1. log1p gives diminishing returns; clamp keeps the effect inside the
+      // existing 0.88–1.20 importance band. The stored importance_score is never mutated.
       const imp = importanceScores.get(parentId) ?? 0;
-      const importanceMultiplier = imp === 0 ? 1.0 : 0.8 + (imp / 5) * 0.4;
+      const wins = contradictionWins.get(parentId) ?? 0;
+      const losses = contradictionLosses.get(parentId) ?? 0;
+      const net = wins - losses;
+      let importanceMultiplier: number;
+      if (imp === 0 && net === 0) {
+        importanceMultiplier = 1.0; // unscored and never contested — unchanged baseline
+      } else {
+        const base = imp === 0 ? 3 : imp; // unscored-but-contested → neutral midpoint
+        const adj = Math.sign(net) * Math.log1p(Math.abs(net)) * CONTRADICTION_IMPORTANCE_STEP;
+        const effectiveImp = Math.max(1, Math.min(5, base + adj));
+        importanceMultiplier = 0.8 + (effectiveImp / 5) * 0.4;
+      }
 
-      return { ...match, score: match.score * combinedMultiplier * appendPenalty * rolledUpPenalty * importanceMultiplier };
+      // Tag boost: applied outside the recency ≤1.0 cap so a tag-relevant memory can
+      // surface above a marginally-closer but irrelevant one.
+      const overlap = queryTags.length ? tags.filter(t => queryTags.includes(t)).length : 0;
+      const tagBoost = overlap ? Math.min(TAG_BOOST_MAX, 1 + overlap * TAG_BOOST_STEP) : 1.0;
+
+      return { ...match, score: match.score * combinedMultiplier * appendPenalty * rolledUpPenalty * importanceMultiplier * tagBoost };
     })
     .sort((a, b) => b.score - a.score);
 }
@@ -469,23 +580,63 @@ export function parseTimePhrase(query: string, now: number): { after?: number; b
   return { cleanQuery: query };
 }
 
-// ─── AI importance scoring ────────────────────────────────────────────────────
+// ─── AI classification (importance + canonical) ───────────────────────────────
 
-async function scoreImportance(content: string, env: Env): Promise<number> {
+// Map the model's free-text kind to our enum — tolerant of case, whitespace, and
+// common synonyms a small model emits (e.g. "event" → episodic, "fact" → semantic).
+function normalizeKind(raw: unknown): MemoryKind | null {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().toLowerCase();
+  if (/episod|event|decision|milestone|occurrence/.test(v)) return "episodic";
+  if (/semantic|fact|preference|knowledge|belief/.test(v)) return "semantic";
+  return null;
+}
+
+// Parse the classifier's response. Tries strict JSON first, then falls back to
+// tolerant per-field extraction so one malformed field (small models intermittently
+// emit e.g. {"canonical":,}) doesn't discard the other valid fields.
+function parseClassification(text: string): { importance: number; canonical: boolean; kind: MemoryKind | null } {
+  const obj = text.match(/\{[^{}]*\}/);
+  if (obj) {
+    try {
+      const p = JSON.parse(obj[0]);
+      return {
+        importance: p.importance >= 1 && p.importance <= 5 ? p.importance : 3,
+        canonical: p.canonical === true,
+        kind: normalizeKind(p.kind),
+      };
+    } catch { /* fall through to tolerant extraction */ }
+  }
+  const imp = text.match(/"importance"\s*:\s*([1-5])/);
+  const can = text.match(/"canonical"\s*:\s*(true|false)/i);
+  const knd = text.match(/"kind"\s*:\s*"?([a-zA-Z]+)/);
+  return {
+    importance: imp ? parseInt(imp[1], 10) : 3,
+    canonical: can ? can[1].toLowerCase() === "true" : false,
+    kind: knd ? normalizeKind(knd[1]) : null,
+  };
+}
+
+export async function classifyEntry(content: string, env: Env): Promise<{ importance: number; canonical: boolean; kind: MemoryKind | null }> {
+  let text: string;
   try {
     const stream = await env.AI.run(LLM_MODEL as any, {
-      messages: [{
-        role: "user", content:
-          `Rate the long-term importance of this memory 1-5. Reply with only a single digit.\n1=trivial 3=useful context 5=critical decision or goal\n\nMemory: ${content.slice(0, 500)}`
+      messages: [{ role: "user", content:
+        `Classify this memory. Respond with ONLY one JSON object and nothing else — no prose, no markdown, no code fences.\n` +
+        `{"importance": <1-5>, "canonical": <true|false>, "kind": "episodic"|"semantic"}\n` +
+        `importance: 1=trivial, 3=useful context, 5=critical decision or goal.\n` +
+        `canonical: true ONLY for a confirmed decision, durable fact, or stated permanent preference that should be authoritative (be conservative; false for anything tentative, one-off, or event-like).\n` +
+        `kind: "episodic" for a specific event/decision/milestone that happened at a point in time; "semantic" for a general fact, preference, or piece of knowledge.\n\n` +
+        `Memory: ${content.slice(0, 500)}`,
       }],
+      max_tokens: CLASSIFY_MAX_TOKENS,
       stream: true,
     });
-    const text = await readStreamText(stream as ReadableStream);
-    const score = parseInt(text.trim(), 10);
-    return score >= 1 && score <= 5 ? score : 3;
+    text = await readStreamText(stream as ReadableStream);
   } catch {
-    return 0;
+    return { importance: 0, canonical: false, kind: null };
   }
+  return parseClassification(text);
 }
 
 // ─── Hashtag extraction ───────────────────────────────────────────────────────
@@ -494,6 +645,43 @@ export function extractHashtags(content: string): { cleanContent: string; hashta
   const hashtags = (content.match(/#\w+/g) ?? []).map(t => t.slice(1).toLowerCase());
   const cleanContent = content.replace(/#\w+/g, '').replace(/\s+/g, ' ').trim();
   return { cleanContent, hashtags };
+}
+
+// ─── Query tag inference ──────────────────────────────────────────────────────
+
+export async function inferQueryTags(query: string, env: Env): Promise<string[]> {
+  const { hashtags } = extractHashtags(query);
+  if (hashtags.length) return hashtags;
+
+  const { results: tagRows } = await env.DB.prepare(
+    `SELECT DISTINCT value FROM entries, json_each(entries.tags) ORDER BY value`
+  ).all();
+  const knownTags = (tagRows as { value: string }[]).map(r => r.value);
+
+  const lowerQuery = query.toLowerCase();
+  const keywordMatches = knownTags.filter(t =>
+    new RegExp(`(?<![\\w-])${t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`, "i").test(lowerQuery)
+  );
+
+  if (keywordMatches.length) return keywordMatches;
+
+  if (!knownTags.length) return [];
+
+  try {
+    const stream = await env.AI.run(LLM_MODEL as any, {
+      messages: [{
+        role: "user",
+        content: `From this list of tags: ${knownTags.slice(0, 50).join(", ")}\n\nWhich tags best match this query? Reply with only a comma-separated list of matching tag names from the list, or nothing if none apply.\n\nQuery: ${query.slice(0, 300)}`,
+      }],
+      max_tokens: 100,
+      stream: true,
+    });
+    const text = await readStreamText(stream as ReadableStream);
+    const knownSet = new Set(knownTags);
+    return text.split(",").map(t => t.trim().toLowerCase()).filter(t => t && knownSet.has(t));
+  } catch {
+    return [];
+  }
 }
 
 // ─── Shared entry-listing filter builder ─────────────────────────────────────
@@ -512,7 +700,7 @@ export function buildEntryFilterQuery(params: {
   if (params.after !== undefined) { conds.push(`created_at >= ?`); bindings.push(params.after); }
   if (params.before !== undefined) { conds.push(`created_at <= ?`); bindings.push(params.before); }
 
-  let sql = `SELECT id, content, tags, source, created_at FROM entries`;
+  let sql = `SELECT id, content, tags, source, created_at, vector_ids FROM entries`;
   if (conds.length) sql += ` WHERE ` + conds.join(` AND `);
   sql += ` ORDER BY created_at DESC LIMIT ?`;
   bindings.push(params.n);
@@ -793,6 +981,14 @@ export async function compressTag(
   env: Env,
   ctx: ExecutionContext
 ): Promise<{ synthesizedId: string | null; entriesUsed: number; text: string }> {
+  // Reserved/namespaced tags (kind:*, status:*) describe a memory's type/lifecycle,
+  // not a topic — digesting them would blend unrelated memories (and could compress
+  // protected/canonical ones). Never compress by them. This also guards /digest and
+  // the web UI Compress button, not just the nightly cron.
+  if (tag.startsWith(STATUS_PREFIX) || tag.startsWith(KIND_PREFIX)) {
+    return { synthesizedId: null, entriesUsed: 0, text: "" };
+  }
+
   const recentSynth = await env.DB.prepare(`
     SELECT id FROM entries
     WHERE tags LIKE '%"synthesized"%'
@@ -812,10 +1008,10 @@ export async function compressTag(
       AND tags NOT LIKE '%"synthesized"%'
       AND tags NOT LIKE '%"auto-pattern"%'
       AND tags NOT LIKE '%"rolled-up"%'
-      AND (importance_score IS NULL OR importance_score < 4)
+      AND ${compressionEligibilitySql()}
     ORDER BY created_at DESC
     LIMIT 50
-  `).bind(`%"${tag}"%`).all();
+  `).bind(`%"${tag}"%`, Date.now() - COMPRESSION_MIN_AGE_MS).all();
 
   if (rawEntries.length < 10) {
     return { synthesizedId: null, entriesUsed: 0, text: "" };
@@ -852,14 +1048,16 @@ async function runNightlyCompression(env: Env, ctx: ExecutionContext): Promise<v
     SELECT value as tag, COUNT(*) as count
     FROM entries, json_each(entries.tags)
     WHERE value NOT IN ('synthesized', 'auto-pattern', 'duplicate-candidate', 'contradiction-resolved', 'rolled-up')
+      AND value NOT LIKE 'status:%'
+      AND value NOT LIKE 'kind:%'
       AND entries.tags NOT LIKE '%"rolled-up"%'
       AND entries.tags NOT LIKE '%"synthesized"%'
       AND entries.tags NOT LIKE '%"auto-pattern"%'
-      AND (entries.importance_score IS NULL OR entries.importance_score < 4)
+      AND ${compressionEligibilitySql("entries.")}
     GROUP BY value
     HAVING count > 10
     ORDER BY count DESC
-  `).all();
+  `).bind(Date.now() - COMPRESSION_MIN_AGE_MS).all();
 
   for (const row of results) {
     const tag = row.tag as string;
@@ -892,12 +1090,12 @@ export interface RecallSearchResult {
 }
 
 export async function recallEntries(
-  params: { query: string; topK: number; tag?: string; after?: number; before?: number },
+  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind },
   env: Env,
   ctx: ExecutionContext
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
-  let { tag, after, before } = params;
+  let { tag, after, before, kind } = params;
   const now = Date.now();
 
   let embedQuery = query;
@@ -908,63 +1106,99 @@ export async function recallEntries(
     embedQuery = parsed.cleanQuery;
   }
 
-  const values = await embed(embedQuery, env);
+  const [values, queryTags] = await Promise.all([
+    embed(embedQuery, env),
+    inferQueryTags(embedQuery, env),
+  ]);
 
-  // If tag filter, resolve matching IDs from D1 first (D1 is source of truth for tags)
-  let tagFilterIds: Set<string> | null = null;
+  let results: { matches: VectorizeMatch[] };
   if (tag) {
+    // Tag path: score the tag's own vectors directly. An unconstrained Vectorize
+    // query caps at 50 candidates, silently dropping tagged entries whose global
+    // semantic rank falls outside the top 50 (issue #141). D1 is the source of
+    // truth for tags and already stores each entry's vector_ids.
     const { results: tagRows } = await env.DB.prepare(
-      `SELECT id FROM entries WHERE tags LIKE ?`
+      `SELECT id, vector_ids FROM entries WHERE tags LIKE ?`
     ).bind(`%"${tag}"%`).all();
-    tagFilterIds = new Set((tagRows as any[]).map(r => r.id as string));
-    if (tagFilterIds.size === 0) return { matches: [], insight: "" };
-  }
+    if (!tagRows.length) return { matches: [], insight: "" };
 
-  // Query Vectorize without filter — tag filtering happens in-memory below
-  // Cloudflare Vectorize caps topK at 50 when returnMetadata="all" (error 40025)
-  const vectorizeTopK = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
-  let results = await env.VECTORIZE.query(values, {
-    topK: vectorizeTopK,
-    returnMetadata: "all",
-  });
+    const vectorIds = [...new Set(
+      (tagRows as any[]).flatMap(r => JSON.parse((r.vector_ids as string) ?? "[]") as string[])
+    )];
+    if (!vectorIds.length) return { matches: [], insight: "" };
 
-  if (results.matches.length && results.matches[0].score < DUPLICATE_FLAG_THRESHOLD) {
+    const vectors: VectorizeVector[] = [];
+    for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
+      vectors.push(...await env.VECTORIZE.getByIds(vectorIds.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH)));
+    }
+
+    results = {
+      matches: vectors.map(v => ({
+        id: v.id,
+        score: cosineSim(values, v.values as number[]),
+        metadata: v.metadata,
+      })) as VectorizeMatch[],
+    };
+  } else {
+    // Cloudflare Vectorize caps topK at 50 when returnMetadata="all" (error 40025)
+    const vectorizeTopK = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
     results = await env.VECTORIZE.query(values, {
-      topK: 50,
+      topK: vectorizeTopK,
       returnMetadata: "all",
     });
+
+    if (results.matches.length && results.matches[0].score < DUPLICATE_FLAG_THRESHOLD) {
+      results = await env.VECTORIZE.query(values, {
+        topK: 50,
+        returnMetadata: "all",
+      });
+    }
   }
 
   if (!results.matches.length) return { matches: [], insight: "" };
 
-  // Fetch recall_count and importance_score for all candidates to use in scoring
+  // Fetch recall_count and importance_score for all candidates to use in scoring.
+  // The tag path can produce far more than 100 candidates, so chunk the IN query
+  // to stay under D1's bound-parameter limit.
   const candidateIds = [...new Set(results.matches.map(m => (m.metadata as any)?.parentId ?? m.id))] as string[];
-  const rcPlaceholders = candidateIds.map(() => "?").join(", ");
-  const { results: rcRows } = await env.DB.prepare(
-    `SELECT id, recall_count, importance_score FROM entries WHERE id IN (${rcPlaceholders})`
-  ).bind(...candidateIds).all() as { results: { id: string; recall_count: number; importance_score: number }[] };
+  const rcRows: { id: string; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number }[] = [];
+  for (let i = 0; i < candidateIds.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = candidateIds.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const rcPlaceholders = batch.map(() => "?").join(", ");
+    const { results: rows } = await env.DB.prepare(
+      `SELECT id, recall_count, importance_score, contradiction_wins, contradiction_losses FROM entries WHERE id IN (${rcPlaceholders})`
+    ).bind(...batch).all() as { results: { id: string; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number }[] };
+    rcRows.push(...rows);
+  }
   const recallCounts = new Map(rcRows.map(r => [r.id, r.recall_count ?? 0]));
   const importanceScores = new Map(rcRows.map(r => [r.id, r.importance_score ?? 0]));
+  const contradictionWins = new Map(rcRows.map(r => [r.id, r.contradiction_wins ?? 0]));
+  const contradictionLosses = new Map(rcRows.map(r => [r.id, r.contradiction_losses ?? 0]));
 
-  const reranked = rerankWithTimeDecay(results.matches as VectorizeMatch[], recallCounts, importanceScores);
+  const reranked = rerankWithTimeDecay(results.matches as VectorizeMatch[], recallCounts, importanceScores, queryTags, contradictionWins, contradictionLosses);
 
   const seen = new Set<string>();
   const deduped = reranked.filter((m) => {
     const parentId = (m.metadata as any)?.parentId ?? m.id;
     if (seen.has(parentId)) return false;
-    // Apply tag filter against D1-resolved IDs
-    if (tagFilterIds && !tagFilterIds.has(parentId)) return false;
     seen.add(parentId);
     return true;
   }).slice(0, topK);
 
   if (!deduped.length) return { matches: [], insight: "" };
 
-  // Fetch full content from D1 for all matched parent IDs, applying time filter if set
+  // Fetch full content from D1 for all matched parent IDs, applying filters: auto-pattern
+  // exclusion, status:deprecated exclusion, optional kind match, and optional after/before range
   const parentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
   const placeholders = parentIds.map(() => "?").join(", ");
   const d1Bindings: (string | number)[] = [...parentIds];
-  let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%'`;
+  let d1Sql = `SELECT id, content, tags, source, created_at FROM entries WHERE id IN (${placeholders}) AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"status:deprecated"%'`;
+  if (kind && (KIND_VALUES as readonly string[]).includes(kind)) {
+    // Safe to interpolate: `kind` is validated against the KIND_VALUES enum just above,
+    // so only "episodic"/"semantic" can reach the string. Kept as a literal (not a bound
+    // param) so it doesn't shift the positional after/before bindings below.
+    d1Sql += ` AND tags LIKE '%"kind:${kind}"%'`;
+  }
   if (after !== undefined) { d1Sql += ` AND created_at >= ?`; d1Bindings.push(after); }
   if (before !== undefined) { d1Sql += ` AND created_at <= ?`; d1Bindings.push(before); }
   const { results: d1Rows } = await env.DB.prepare(d1Sql).bind(...d1Bindings).all() as { results: Record<string, any>[] };
@@ -980,34 +1214,26 @@ export async function recallEntries(
     ).catch(e => console.error("recall_count update failed (non-fatal):", e))
   );
 
-  const matches: RecallMatch[] = deduped.map((m) => {
+  const matches: RecallMatch[] = deduped.flatMap((m) => {
     const meta = m.metadata as Record<string, any>;
     const parentId = (meta?.parentId ?? m.id) as string;
     const row = d1Map.get(parentId);
     const isUpdate = !!meta?.isUpdate;
 
-    if (row) {
-      return {
-        id: parentId,
-        content: row.content as string,
-        score: m.score,
-        createdAt: row.created_at as number,
-        tags: JSON.parse(row.tags ?? "[]"),
-        source: row.source as string,
-        isUpdate,
-      };
+    if (!row) {
+      // D1 row not found — either filtered out (e.g. status:deprecated) or genuinely missing
+      return [];
     }
 
-    // Fallback to metadata if D1 row not found (shouldn't happen)
-    return {
+    return [{
       id: parentId,
-      content: (meta?.content as string) ?? "",
+      content: row.content as string,
       score: m.score,
-      createdAt: (meta?.created_at as number) ?? now,
-      tags: Array.isArray(meta?.tags) ? (meta.tags as string[]) : [],
-      source: (meta?.source as string) ?? "",
+      createdAt: row.created_at as number,
+      tags: JSON.parse(row.tags ?? "[]"),
+      source: row.source as string,
       isUpdate,
-    };
+    }];
   });
 
   const insight = d1Rows.length > 1
@@ -1026,11 +1252,31 @@ export async function recallEntries(
 
 // ─── Shared write path ────────────────────────────────────────────────────────
 
+// Classify an entry's content (importance + canonical + kind) and apply the tags,
+// asynchronously. Used for both newly-inserted entries and smart-merge targets.
+function scheduleClassifyAndTag(entryId: string, content: string, env: Env, ctx: ExecutionContext): void {
+  ctx.waitUntil(
+    classifyEntry(content, env)
+      .then(async ({ importance, canonical, kind }) => {
+        await env.DB.prepare(`UPDATE entries SET importance_score = ? WHERE id = ?`).bind(importance, entryId).run();
+        if (!kind && !canonical) return;
+        const row = await env.DB.prepare(`SELECT tags FROM entries WHERE id = ?`).bind(entryId).first() as Record<string, any> | null;
+        if (!row) return;
+        let tags: string[] = JSON.parse(row.tags ?? "[]");
+        if (kind) tags = withKind(tags, kind);
+        if (canonical && getStatus(tags) === null) tags = withStatus(tags, "canonical");
+        await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`).bind(JSON.stringify(tags), entryId).run();
+      })
+      .catch(e => console.error("Classification failed (non-fatal):", e))
+  );
+}
+
 export type CaptureResult =
   | { status: "blocked"; matchId: string; score: number }
   | { status: "stored"; id: string }
   | { status: "flagged"; id: string; matchId: string; score: number }
   | { status: "contradiction"; id: string; resolvedConflict: string; reason?: string }
+  | { status: "contradiction_protected"; id: string; canonicalId: string; reason?: string }
   | { status: "merged"; id: string }
   | { status: "replaced"; id: string };
 
@@ -1066,9 +1312,10 @@ export async function captureEntry(
       const existingSource = targetRow.source as string;
       const oldVectorIds: string[] = JSON.parse(targetRow.vector_ids ?? "[]");
 
-      // Protect high-importance memories from being silently overwritten.
-      // Score ≥ 4 means the existing entry is critical — keep both rather than replace.
-      if ((targetRow.importance_score as number) >= 4) {
+      // Protect high-importance or canonical memories from being silently overwritten.
+      // Score ≥ 4 means the existing entry is critical; canonical = confirmed authoritative.
+      const targetStatus = getStatus(existingTags);
+      if ((targetRow.importance_score as number) >= 4 || targetStatus === "canonical") {
         return { status: "flagged", id: crypto.randomUUID(), matchId: targetId, score: dup.score };
       }
 
@@ -1085,6 +1332,9 @@ export async function captureEntry(
       try {
         await deleteStaleVectors(env, oldVectorIds, newVectorIds);
       } catch (e) { console.error("Old vector cleanup failed (non-fatal):", e); }
+
+      // Re-classify the merged/replaced content — updates importance_score + kind (and canonical if warranted) on the target.
+      scheduleClassifyAndTag(targetId, newContent, env, ctx);
 
       return mergeAction.action === "merge"
         ? { status: "merged", id: targetId }
@@ -1107,23 +1357,45 @@ export async function captureEntry(
       .catch(e => console.error("Vectorize insert failed (non-fatal):", e))
   );
 
-  ctx.waitUntil(
-    scoreImportance(c, env)
-      .then(score => env.DB.prepare(`UPDATE entries SET importance_score = ? WHERE id = ?`).bind(score, id).run())
-      .catch(e => console.error("Importance scoring failed (non-fatal):", e))
-  );
+  scheduleClassifyAndTag(id, c, env, ctx);
 
   if (contradiction.detected && contradiction.conflicting_id) {
     const conflictId = contradiction.conflicting_id;
+    const conflictRow = await env.DB.prepare(
+      `SELECT tags FROM entries WHERE id = ?`
+    ).bind(conflictId).first() as Record<string, any> | null;
+    const conflictStatus = conflictRow ? getStatus(JSON.parse(conflictRow.tags ?? "[]")) : null;
+
+    if (conflictStatus === "canonical") {
+      // Don't overwrite a canonical memory — keep it, demote the new entry to draft.
+      // Strip "contradiction-resolved" — that tag marks entries that WON a contradiction;
+      // this entry lost, so it must not carry that tag.
+      const draftTags = finalTags.filter(t => t !== "contradiction-resolved");
+      await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`)
+        .bind(JSON.stringify(withStatus(draftTags, "draft")), id).run();
+      // Record the outcome: canonical incumbent survived (win), new draft lost (loss).
+      // Non-fatal — a failed count update must not abort capture.
+      try {
+        await env.DB.prepare(`UPDATE entries SET contradiction_wins = contradiction_wins + 1 WHERE id = ?`).bind(conflictId).run();
+        await env.DB.prepare(`UPDATE entries SET contradiction_losses = contradiction_losses + 1 WHERE id = ?`).bind(id).run();
+      } catch (e) {
+        console.error("Contradiction count update failed (non-fatal):", e);
+      }
+      return { status: "contradiction_protected", id, canonicalId: conflictId, reason: contradiction.reason };
+    }
+
+    // Non-canonical loser: the new entry wins; the incumbent loses and is deprecated
+    // (row kept for audit). Record the outcome before deprecating. Non-fatal.
     try {
-      const conflictRow = await env.DB.prepare(
-        `SELECT vector_ids FROM entries WHERE id = ?`
-      ).bind(conflictId).first() as Record<string, any> | null;
-      const conflictVectorIds: string[] = JSON.parse(conflictRow?.vector_ids ?? "[]");
-      await env.DB.prepare(`DELETE FROM entries WHERE id = ?`).bind(conflictId).run();
-      if (conflictVectorIds.length) await env.VECTORIZE.deleteByIds(conflictVectorIds);
+      await env.DB.prepare(`UPDATE entries SET contradiction_wins = contradiction_wins + 1 WHERE id = ?`).bind(id).run();
+      await env.DB.prepare(`UPDATE entries SET contradiction_losses = contradiction_losses + 1 WHERE id = ?`).bind(conflictId).run();
     } catch (e) {
-      console.error("Contradiction resolution cleanup failed (non-fatal):", e);
+      console.error("Contradiction count update failed (non-fatal):", e);
+    }
+    try {
+      await deprecateEntry(conflictId, env);
+    } catch (e) {
+      console.error("Contradiction deprecation failed (non-fatal):", e);
     }
     return { status: "contradiction", id, resolvedConflict: conflictId, reason: contradiction.reason };
   }
@@ -1166,6 +1438,39 @@ export async function forgetEntry(id: string, env: Env): Promise<ForgetResult> {
   return { status: "deleted", vectorCount: vectorIds.length };
 }
 
+// Deprecate (issue #119): keep the D1 row for audit but make the entry
+// unrecallable by deleting its vectors and tagging it status:deprecated.
+export async function deprecateEntry(id: string, env: Env): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT tags, vector_ids FROM entries WHERE id = ?`
+  ).bind(id).first() as Record<string, any> | null;
+  if (!row) return false;
+
+  const tags: string[] = JSON.parse(row.tags ?? "[]");
+  const vectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
+
+  await env.DB.prepare(`UPDATE entries SET tags = ?, vector_ids = ? WHERE id = ?`)
+    .bind(JSON.stringify(withStatus(tags, "deprecated")), "[]", id).run();
+
+  try {
+    if (vectorIds.length) await env.VECTORIZE.deleteByIds(vectorIds);
+  } catch (e) {
+    console.error("Vectorize deleteByIds failed during deprecate (non-fatal):", e);
+  }
+  return true;
+}
+
+// Apply a lifecycle status to an entry (issue #119). 'deprecated' deletes vectors
+// (via deprecateEntry); others swap the status:* tag in place. Returns ok=false if no such entry.
+export async function applyStatus(id: string, status: MemoryStatus, env: Env): Promise<boolean> {
+  if (status === "deprecated") return deprecateEntry(id, env);
+  const row = await env.DB.prepare(`SELECT tags FROM entries WHERE id = ?`).bind(id).first() as Record<string, any> | null;
+  if (!row) return false;
+  const tags: string[] = JSON.parse(row.tags ?? "[]");
+  await env.DB.prepare(`UPDATE entries SET tags = ? WHERE id = ?`).bind(JSON.stringify(withStatus(tags, status)), id).run();
+  return true;
+}
+
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
 function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
@@ -1189,6 +1494,9 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       }
       if (result.status === "contradiction") {
         return { content: [{ type: "text", text: `Stored. ID: ${result.id} — resolved contradiction with entry ${result.resolvedConflict}${result.reason ? `: ${result.reason}` : ""}.` }] };
+      }
+      if (result.status === "contradiction_protected") {
+        return { content: [{ type: "text", text: `Stored as draft (ID: ${result.id}) — conflicts with a canonical memory (${result.canonicalId}), which was kept${result.reason ? `: ${result.reason}` : ""}.` }] };
       }
       if (result.status === "replaced") {
         return { content: [{ type: "text", text: `Memory updated — new content replaced outdated entry (ID: ${result.id}).` }] };
@@ -1308,6 +1616,23 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
     }
   );
 
+  // ── set_status ─────────────────────────────────────────────────────────────
+  server.registerTool(
+    "set_status",
+    {
+      description: "Set a memory's lifecycle status. 'canonical' = confirmed/authoritative (protected from auto-overwrite), 'draft' = tentative, 'deprecated' = no longer accurate (removed from recall, kept for audit). Get the entry ID from recall or list_recent first.",
+      inputSchema: {
+        id: z.string().describe("Entry ID — from recall or list_recent"),
+        status: z.enum([...STATUS_VALUES] as [string, ...string[]]).describe("canonical | draft | deprecated"),
+      },
+    },
+    async ({ id, status }) => {
+      const ok = await applyStatus(id, status as MemoryStatus, env);
+      if (!ok) return { content: [{ type: "text", text: `No entry found with ID: ${id}` }] };
+      return { content: [{ type: "text", text: status === "deprecated" ? `Entry ${id} deprecated — removed from recall, kept for audit.` : `Entry ${id} marked ${status}.` }] };
+    }
+  );
+
   // ── recall ───────────────────────────────────────────────────────────────
   server.registerTool(
     "recall",
@@ -1319,10 +1644,11 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
         tag: z.string().optional().describe("Filter by a specific tag"),
         after: z.number().int().optional().describe("Only return entries after this Unix ms timestamp"),
         before: z.number().int().optional().describe("Only return entries before this Unix ms timestamp"),
+        kind: z.enum([...KIND_VALUES] as [string, ...string[]]).optional().describe("Filter to episodic (events) or semantic (facts/knowledge)"),
       },
     },
-    async ({ query, topK, tag, after, before }) => {
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before }, env, ctx);
+    async ({ query, topK, tag, after, before, kind }) => {
+      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined }, env, ctx);
 
       if (!matches.length) {
         return { content: [{ type: "text", text: "Nothing found matching that query." }] };
@@ -1478,6 +1804,9 @@ const defaultHandler = {
       if (result.status === "contradiction") {
         return json({ ok: true, id: result.id, resolved_conflict: result.resolvedConflict, reason: result.reason });
       }
+      if (result.status === "contradiction_protected") {
+        return json({ ok: true, id: result.id, status: "draft", kept_canonical: result.canonicalId, reason: result.reason });
+      }
       if (result.status === "replaced") {
         return json({ ok: true, id: result.id, action: "replaced", message: "New memory replaced an outdated existing entry" });
       }
@@ -1603,22 +1932,29 @@ const defaultHandler = {
     if (url.pathname === "/stats" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const graceCutoff = Date.now() - graceMs(env);
       const [summary, tagRows, candidateRows] = await Promise.all([
-        env.DB.prepare(`SELECT COUNT(*) as count, AVG(importance_score) as avg_importance FROM entries`).first() as Promise<Record<string, any> | null>,
+        env.DB.prepare(
+          `SELECT COUNT(*) as count, AVG(importance_score) as avg_importance,
+           SUM(CASE WHEN vector_ids = '[]' AND created_at < ? THEN 1 ELSE 0 END) as unvectorized
+           FROM entries`
+        ).bind(graceCutoff).first() as Promise<Record<string, any> | null>,
         env.DB.prepare(`SELECT value, COUNT(*) as n FROM entries, json_each(entries.tags) GROUP BY value ORDER BY n DESC LIMIT 5`).all(),
         env.DB.prepare(`
           SELECT value as tag, COUNT(*) as count
           FROM entries, json_each(entries.tags)
           WHERE value NOT IN ('synthesized', 'auto-pattern', 'duplicate-candidate', 'contradiction-resolved', 'rolled-up')
+            AND value NOT LIKE 'status:%'
+            AND value NOT LIKE 'kind:%'
             AND entries.tags NOT LIKE '%"rolled-up"%'
             AND entries.tags NOT LIKE '%"synthesized"%'
             AND entries.tags NOT LIKE '%"auto-pattern"%'
-            AND (entries.importance_score IS NULL OR entries.importance_score < 4)
+            AND ${compressionEligibilitySql("entries.")}
           GROUP BY value
           HAVING count > 10
           ORDER BY count DESC
           LIMIT 10
-        `).all(),
+        `).bind(Date.now() - COMPRESSION_MIN_AGE_MS).all(),
       ]);
 
       const cutoff = Date.now() - 86400000;
@@ -1635,6 +1971,8 @@ const defaultHandler = {
         avg_importance: summary?.avg_importance != null ? Math.round((summary.avg_importance as number) * 10) / 10 : null,
         top_tags: (tagRows.results as any[]).map(r => r.value as string),
         digest_candidates: digestCandidates,
+        unvectorized: (summary?.unvectorized as number) ?? 0,
+        vectorize_grace_ms: graceMs(env),
       });
     }
 
@@ -1664,8 +2002,10 @@ const defaultHandler = {
       const tag = url.searchParams.get("tag")?.trim() || undefined;
       const after = url.searchParams.has("after") ? parseInt(url.searchParams.get("after")!, 10) : undefined;
       const before = url.searchParams.has("before") ? parseInt(url.searchParams.get("before")!, 10) : undefined;
+      const kindParam = url.searchParams.get("kind")?.trim();
+      const kind = kindParam && (KIND_VALUES as readonly string[]).includes(kindParam) ? kindParam as MemoryKind : undefined;
 
-      const { matches, insight } = await recallEntries({ query, topK, tag, after, before }, env, ctx);
+      const { matches, insight } = await recallEntries({ query, topK, tag, after, before, kind }, env, ctx);
 
       if (!matches.length) {
         return json({ ok: true, results: [], message: "Nothing found matching that query." });
@@ -1703,6 +2043,29 @@ const defaultHandler = {
       }
 
       return json({ ok: true, id, deletedVectors: result.vectorCount });
+    }
+
+    // POST /status — set lifecycle status, mirrors the MCP `set_status` tool
+    if (url.pathname === "/status" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      let body: { id?: string; status?: string };
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
+      if (!(STATUS_VALUES as readonly string[]).includes(body.status ?? "")) {
+        return json({ ok: false, error: `status must be one of: ${STATUS_VALUES.join(", ")}` }, 400);
+      }
+
+      const id = body.id.trim();
+      const status = body.status as MemoryStatus;
+      const ok = await applyStatus(id, status, env);
+
+      if (!ok) {
+        return json({ ok: false, error: `No entry found with ID: ${id}` }, 404);
+      }
+
+      return json({ ok: true, id, status });
     }
 
     // POST /chat
@@ -1746,6 +2109,46 @@ const defaultHandler = {
       }
 
       return json({ tag, synthesis: result.text, entry_id: result.synthesizedId, source_count: result.entriesUsed });
+    }
+
+    // POST /vectorize-pending
+    if (url.pathname === "/vectorize-pending" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const graceCutoff = Date.now() - graceMs(env);
+
+      const { results: toProcess } = await env.DB.prepare(
+        `SELECT id, content, tags, source, created_at FROM entries
+         WHERE vector_ids = '[]' AND created_at < ?
+         ORDER BY created_at DESC LIMIT 25`
+      ).bind(graceCutoff).all();
+
+      let processed = 0;
+      let failed = 0;
+
+      for (const row of toProcess as Record<string, any>[]) {
+        try {
+          await storeEntry(
+            env,
+            row.id as string,
+            row.content as string,
+            JSON.parse(row.tags as string),
+            row.source as string,
+            row.created_at as number
+          );
+          processed++;
+        } catch (e) {
+          console.error("Re-embed failed for entry", row.id, e);
+          failed++;
+        }
+      }
+
+      const remaining = await env.DB.prepare(
+        `SELECT COUNT(*) as count FROM entries WHERE vector_ids = '[]' AND created_at < ?`
+      ).bind(graceCutoff).first() as Record<string, any> | null;
+
+      return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
     }
 
     return new Response("Not found", { status: 404 });

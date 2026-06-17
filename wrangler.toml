@@ -29,6 +29,9 @@ id = "d534b75604004e7b893ea85543938b50"
 # Create manually: wrangler kv namespace create OAUTH_KV
 # then paste the returned id above.
 
+[vars]
+VECTORIZE_GRACE_MS = "300000"
+
 [assets]
 directory = "./public"
 
