@@ -1,0 +1,45 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "second-brain",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-06-17",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "second-brain-db"
+		}
+	],
+	// The VECTORIZE binding is intentionally NOT declared here. When a vectorize
+	// binding is present in this file, the one-click "Deploy to Cloudflare" form
+	// prompts for index dimensions/metric with no way to preset them, leaving
+	// users stuck on blank fields (cloudflare/workers-sdk#14075). Instead,
+	// scripts/prepare-wrangler.mjs creates the index (384 dims / cosine) and
+	// injects the binding at deploy time into a generated wrangler.deploy.jsonc.
+	// Deploy with `npm run deploy` and run locally with `npm run dev` — calling
+	// `wrangler deploy`/`wrangler dev` directly will omit the VECTORIZE binding.
+	"ai": {
+		"binding": "AI"
+	},
+	"kv_namespaces": [
+		{
+			"binding": "OAUTH_KV"
+		}
+	],
+	"vars": {
+		"VECTORIZE_GRACE_MS": "300000"
+	},
+	"secrets": {
+		"required": ["AUTH_TOKEN"]
+	},
+	"assets": {
+		"directory": "./public"
+	},
+	"triggers": {
+		"crons": [
+			"0 1 * * *"
+		]
+	}
+}

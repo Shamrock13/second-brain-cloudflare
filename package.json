@@ -3,12 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "dev": "node scripts/prepare-wrangler.mjs && wrangler dev --config wrangler.deploy.jsonc",
+    "deploy": "node scripts/prepare-wrangler.mjs --create && wrangler deploy --config wrangler.deploy.jsonc",
     "db:create": "wrangler d1 create second-brain-db",
     "db:migrate": "wrangler d1 execute second-brain-db --file=db/schema.sql",
     "db:migrate:remote": "wrangler d1 execute second-brain-db --remote --file=db/schema.sql",
-    "vectors:create": "wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -26,7 +25,7 @@
     "@vitest/coverage-v8": "^4.1.7",
     "typescript": "^5.5.0",
     "vitest": "^4.1.7",
-    "wrangler": "^4.93.0"
+    "wrangler": "^4.101.0"
   },
   "cloudflare": {
     "bindings": {
