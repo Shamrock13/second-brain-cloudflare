@@ -12,7 +12,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc --noEmit"
+    "cf-typegen": "wrangler types",
+    "typecheck": "wrangler types && tsc --noEmit"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^0.7.0",
@@ -21,7 +22,6 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20241022.0",
     "@types/node": "^25.9.1",
     "@vitest/coverage-v8": "^4.1.7",
     "typescript": "^5.5.0",
@@ -32,14 +32,6 @@
     "bindings": {
       "AUTH_TOKEN": {
         "description": "Your authentication token. Use a memorable phrase (like 'coffee-lover-2026') or generate a secure token with: openssl rand -base64 32. Save it - you'll need this for AI client connections!"
-      },
-      "VECTORIZE_DIMENSIONS": {
-        "description": "Number of dimensions for the Vectorize index = 384",
-        "default": "384"
-      },
-      "VECTORIZE_METRIC": {
-        "description": "Cosine is recommended for semantic search",
-        "default": "cosine"
       }
     }
   }

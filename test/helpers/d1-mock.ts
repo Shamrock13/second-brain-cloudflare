@@ -2,6 +2,7 @@ import { COMPRESSION_IMPORTANCE_THRESHOLD, COMPRESSION_MIN_RECALL } from "../../
 
 export class D1Mock {
   entries: any[] = [];
+  edges: any[] = [];
 
   prepare(sql: string) {
     const s = sql.replace(/\s+/g, " ").trim();
@@ -101,6 +102,43 @@ export class D1Mock {
           db.entries = db.entries.filter((e: any) => e.id !== id);
           return { meta: { changes: before - db.entries.length } };
         }
+        if (s.startsWith("INSERT INTO edges")) {
+          const [id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at] = args;
+          const existing = db.edges.find((e: any) => e.source_id === source_id && e.target_id === target_id && e.type === type);
+          if (existing) {
+            existing.weight = Math.max(existing.weight, weight); // ON CONFLICT ... max(weight)
+            existing.updated_at = updated_at;
+          } else {
+            db.edges.push({ id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at });
+          }
+          return { meta: { changes: 1 } };
+        }
+        if (s.startsWith("DELETE FROM edges WHERE ((source_id")) {
+          // deleteEdge: order-agnostic pair delete, optional trailing type filter.
+          const [a, b, c, d, type] = args;
+          const before = db.edges.length;
+          db.edges = db.edges.filter((e: any) => {
+            const pairMatch = (e.source_id === a && e.target_id === b) || (e.source_id === c && e.target_id === d);
+            if (!pairMatch) return true;
+            if (type && e.type !== type) return true;
+            return false;
+          });
+          return { meta: { changes: before - db.edges.length } };
+        }
+        if (s.startsWith("DELETE FROM edges WHERE source_id")) {
+          // Cascade delete on forget: source_id = ? OR target_id = ? (both bound to the same id).
+          const [sid, tid] = args;
+          const before = db.edges.length;
+          db.edges = db.edges.filter((e: any) => e.source_id !== sid && e.target_id !== tid);
+          return { meta: { changes: before - db.edges.length } };
+        }
+        if (s.startsWith("DELETE FROM edges WHERE provenance")) {
+          // runGraphPass prune: inferred edges below a weight, older than a cutoff.
+          const [weight, age] = args;
+          const before = db.edges.length;
+          db.edges = db.edges.filter((e: any) => !(e.provenance === "inferred" && e.weight < weight && e.updated_at < age));
+          return { meta: { changes: before - db.edges.length } };
+        }
         return { meta: {} };
       },
       async first() {
@@ -118,11 +156,16 @@ export class D1Mock {
           const unvectorized = cutoff !== undefined
             ? db.entries.filter((e: any) => e.vector_ids === '[]' && e.created_at < cutoff).length
             : 0;
-          return { count, avg_importance, unvectorized };
+          const unclassified = db.entries.filter((e: any) => !String(e.tags).includes('"status:') && !String(e.tags).includes('"kind:')).length;
+          return { count, avg_importance, unvectorized, unclassified };
         }
         if (s.includes("COUNT(*) as count") && s.includes("vector_ids = '[]'") && s.includes("created_at <")) {
           const cutoff = Number(args[0]);
           const count = db.entries.filter((e: any) => e.vector_ids === '[]' && e.created_at < cutoff).length;
+          return { count };
+        }
+        if (s.includes("COUNT(*) as count") && s.includes(`tags NOT LIKE '%"status:%'`) && s.includes(`tags NOT LIKE '%"kind:%'`)) {
+          const count = db.entries.filter((e: any) => !String(e.tags).includes('"status:') && !String(e.tags).includes('"kind:')).length;
           return { count };
         }
         if (s.includes("COUNT(*) as count")) {
@@ -173,6 +216,65 @@ export class D1Mock {
             .slice(0, limit)
             .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
           return { results: rows };
+        }
+        if (s.includes("FROM entries") && s.includes("id NOT IN (SELECT source_id FROM edges)")) {
+          // runGraphPass backfill: entries not referenced by any edge, newest first.
+          const linked = new Set(db.edges.flatMap((e: any) => [e.source_id, e.target_id]));
+          const limitMatch = s.match(/LIMIT (\d+)/);
+          const limit = limitMatch ? parseInt(limitMatch[1], 10) : 25;
+          const rows = [...db.entries]
+            .filter((e: any) => {
+              if (linked.has(e.id)) return false;
+              if (s.includes('"status:deprecated"') && (JSON.parse(e.tags ?? "[]") as string[]).includes("status:deprecated")) return false;
+              return true;
+            })
+            .sort((a: any, b: any) => b.created_at - a.created_at)
+            .slice(0, limit)
+            .map((e: any) => ({ id: e.id, content: e.content }));
+          return { results: rows };
+        }
+        if (s.includes("FROM edges WHERE source_id IN") && s.includes("OR target_id IN")) {
+          // expandGraph BFS / graph edge fetch: every edge touching the frontier, strongest
+          // first. Args are the frontier id list bound twice (source_id IN …, target_id IN …).
+          const ids = new Set(args.map((a: any) => String(a)));
+          const results = db.edges
+            .filter((e: any) => ids.has(e.source_id) || ids.has(e.target_id))
+            .sort((a: any, b: any) => b.weight - a.weight)
+            .map((e: any) => ({ source_id: e.source_id, target_id: e.target_id, type: e.type, weight: e.weight }));
+          return { results };
+        }
+        if (s.includes("SELECT source_id, target_id FROM edges ORDER BY weight DESC")) {
+          // buildGraph default mode: strongest edges first (to derive the node set).
+          const limitMatch = s.match(/LIMIT (\d+)/);
+          const limit = limitMatch ? parseInt(limitMatch[1], 10) : db.edges.length;
+          const results = [...db.edges]
+            .sort((a: any, b: any) => b.weight - a.weight)
+            .slice(0, limit)
+            .map((e: any) => ({ source_id: e.source_id, target_id: e.target_id }));
+          return { results };
+        }
+        if (s.includes("SELECT id, content, tags, importance_score, created_at FROM entries WHERE id IN")) {
+          // buildGraph node hydration.
+          const results = db.entries
+            .filter((e: any) => args.includes(e.id))
+            .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, importance_score: e.importance_score ?? 0, created_at: e.created_at }));
+          return { results };
+        }
+        if (s.includes("SELECT id, tags FROM entries WHERE id IN")) {
+          // expandGraph deprecation check.
+          const results = db.entries
+            .filter((e: any) => args.includes(e.id))
+            .map((e: any) => ({ id: e.id, tags: e.tags }));
+          return { results };
+        }
+        if (s.includes("SELECT id, content, tags, source, created_at FROM entries WHERE id IN") && !s.includes("tags NOT LIKE")) {
+          // Graph node hydration (/connections, /graph). The `tags NOT LIKE` guard
+          // keeps this from shadowing recall's hydration query (same columns, but it
+          // applies the auto-pattern/deprecated/kind filters itself further down).
+          const results = db.entries
+            .filter((e: any) => args.includes(e.id))
+            .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
+          return { results };
         }
         if (s.includes("SELECT id, recall_count, importance_score") && s.includes("WHERE id IN")) {
           const results = db.entries
@@ -277,6 +379,16 @@ export class D1Mock {
           });
           return { results: [...tags].sort().map(t => ({ value: t })) };
         }
+        if (s.includes(`tags NOT LIKE '%"status:%'`) && s.includes(`tags NOT LIKE '%"kind:%'`) && s.includes("ORDER BY created_at ASC LIMIT")) {
+          const limitMatch = s.match(/LIMIT\s+(\d+)/i);
+          const limit = limitMatch ? parseInt(limitMatch[1], 10) : 25;
+          const rows = [...db.entries]
+            .filter((e: any) => !String(e.tags).includes('"status:') && !String(e.tags).includes('"kind:'))
+            .sort((a: any, b: any) => a.created_at - b.created_at)
+            .slice(0, limit)
+            .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags }));
+          return { results: rows };
+        }
         if (s.includes("vector_ids = '[]' AND created_at <") && s.includes("ORDER BY created_at DESC LIMIT")) {
           const cutoff = Number(args[0]);
           const limitMatch = s.match(/LIMIT\s+(\d+)/i);
@@ -287,6 +399,25 @@ export class D1Mock {
             .slice(0, limit)
             .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
           return { results: rows };
+        }
+        if (s.startsWith("SELECT id, content, tags, source, created_at, recall_count, importance_score, contradiction_wins, contradiction_losses FROM entries ORDER BY created_at DESC")) {
+          // GET /export: every entry, newest first, no LIMIT.
+          const results = [...db.entries]
+            .sort((a: any, b: any) => b.created_at - a.created_at)
+            .map((e: any) => ({
+              id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at,
+              recall_count: e.recall_count ?? 0, importance_score: e.importance_score ?? 0,
+              contradiction_wins: e.contradiction_wins ?? 0, contradiction_losses: e.contradiction_losses ?? 0,
+            }));
+          return { results };
+        }
+        if (s.startsWith("SELECT source_id, target_id, type, weight, provenance, created_at FROM edges")) {
+          // GET /export: the whole edges table.
+          const results = db.edges.map((e: any) => ({
+            source_id: e.source_id, target_id: e.target_id, type: e.type,
+            weight: e.weight, provenance: e.provenance, created_at: e.created_at,
+          }));
+          return { results };
         }
         if (s.includes("ORDER BY created_at DESC LIMIT")) {
           const limit = Number(args[args.length - 1]);
@@ -321,5 +452,5 @@ export class D1Mock {
 
   async exec(_sql: string) { }
   async batch(stmts: any[]) { return Promise.all(stmts.map((s: any) => s.run())); }
-  reset() { this.entries = []; }
+  reset() { this.entries = []; this.edges = []; }
 }

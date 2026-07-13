@@ -571,3 +571,60 @@ describe("GET /recall", () => {
     expect(data.results[0].id).toBe("v19");
   });
 });
+
+describe("GET /recall — missing Vectorize index", () => {
+  it("degrades to keyword-only and flags semantic_unavailable", async () => {
+    const db = makeTestDb();
+    db.entries.push({
+      id: "k1", content: "pricing model decision notes", tags: "[]", source: "api",
+      created_at: Date.now(), vector_ids: "[]", recall_count: 0, importance_score: 0,
+    });
+    const env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockRejectedValue(new Error("index not found")) }),
+    });
+    const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
+
+    const res = await worker.fetch(req("GET", "/recall?query=pricing"), env, ctx);
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    expect(data.ok).toBe(true);
+    expect(data.semantic_unavailable).toBe(true);
+    expect(data.results.some((r: any) => r.id === "k1")).toBe(true);
+  });
+
+  it("tag-path: degrades to keyword-only when getByIds fails", async () => {
+    const db = makeTestDb();
+    db.entries.push({
+      id: "t1", content: "quarterly pricing review", tags: JSON.stringify(["finance"]),
+      source: "api", created_at: Date.now(), vector_ids: '["t1"]', recall_count: 0, importance_score: 0,
+    });
+    const env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ getByIds: vi.fn().mockRejectedValue(new Error("index not found")) }),
+    });
+    const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
+    const res = await worker.fetch(req("GET", "/recall?query=pricing&tag=finance"), env, ctx);
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    expect(data.ok).toBe(true);
+    expect(data.semantic_unavailable).toBe(true);
+    expect(data.results.some((r: any) => r.id === "t1")).toBe(true);
+  });
+
+  it("does NOT flag semantic_unavailable when only the widen-query fails", async () => {
+    const db = makeTestDb();
+    db.entries.push({
+      id: "w1", content: "widen path content", tags: "[]", source: "api",
+      created_at: Date.now(), vector_ids: '["w1"]', recall_count: 0, importance_score: 0,
+    });
+    const query = vi.fn()
+      .mockResolvedValueOnce({ matches: [{ id: "w1", score: 0.1, metadata: { parentId: "w1", content: "widen path content", created_at: Date.now(), tags: [], source: "api" } }] })
+      .mockRejectedValueOnce(new Error("widen failed"));
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query }) });
+    const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
+    const res = await worker.fetch(req("GET", "/recall?query=widen"), env, ctx);
+    expect(res.status).toBe(200);
+    const data = await res.json() as any;
+    expect(data.semantic_unavailable).toBe(false);
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+});
