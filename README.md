@@ -12,9 +12,11 @@ Second Brain gives every AI tool access to the same persistent memory.
 
 Unlike memory built into a single app, this memory belongs to you. It runs in your own Cloudflare account, stays under your control, and cannot be locked inside one AI platform.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/rahilp/second-brain-cloudflare)
+**The easiest way to get started is the desktop app.** It sets everything up for you in about two minutes — no terminal, no accounts to wire together, no technical steps.
 
-Deploying takes about two minutes. See the [Quick Start](#quick-start) for the required configuration values.
+### [⬇ Download for Mac or Windows](../../releases/latest)
+
+Prefer to run it yourself? Use the one-click **[Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/rahilp/second-brain-cloudflare)** button, or follow the manual steps. See the [Quick Start](#quick-start) for all three options.
 
 > ## #3 Product of the Day on Product Hunt
 >
@@ -77,7 +79,19 @@ Memory is most useful when capturing information is easy. Second Brain connects 
 
 ## Quick Start
 
-Set up your Second Brain in three steps.
+Pick the option that fits you. They all deploy the same Second Brain into your own Cloudflare account — the difference is only how much setup you do by hand.
+
+## Option 1 — Desktop app (recommended, no technical steps)
+
+The lowest-friction way to get started. **[Download the Second Brain desktop app](../../releases/latest)** for Mac or Windows, open it, and it walks you through setup in about two minutes: you pick a password, sign in to (or create) a free Cloudflare account, and it builds your Second Brain in your own private space and connects your AI tools for you. After setup it becomes the app you open your dashboard with every day.
+
+Nothing to install beyond the app itself — no terminal, no git, no configuration values to copy. Developers: see [`installer/`](installer/) for how it works and how to build it.
+
+> The Mac build is signed and notarized by Apple. The Windows build is not yet code-signed, so Windows may show a SmartScreen "unrecognized app" notice on first launch — click **More info → Run anyway**. (Code signing for Windows is in progress.)
+
+## Option 2 — One-click Cloudflare deploy
+
+Prefer to deploy the Worker yourself without the app? Set it up in three steps.
 
 ### 1. Choose an authentication token
 
@@ -216,10 +230,9 @@ OAuth requires the `OAUTH_KV` namespace for client registrations and tokens. The
 
 </details>
 
-<details>
-<summary><strong>Manual deployment</strong></summary>
+## Option 3 — Manual deployment
 
-To deploy without the one-click button:
+For developers who want full control from the command line. Requires Node.js and a Cloudflare account.
 
 ```bash
 npm install
@@ -227,9 +240,7 @@ npm run vectors:create
 npm run deploy
 ```
 
-`npm run vectors:create` creates the Vectorize index (384 dimensions, cosine). Wrangler then provisions the remaining Cloudflare resources automatically and fills in the required values in `wrangler.jsonc`.
-
-</details>
+`npm run vectors:create` creates the Vectorize index (384 dimensions, cosine). Wrangler then provisions the remaining Cloudflare resources automatically and fills in the required values in `wrangler.jsonc`. Then connect your AI clients using the same steps as Option 2, step 3.
 
 ## Documentation
 
@@ -256,6 +267,24 @@ Second Brain is built with:
 It runs within Cloudflare's free tier at personal scale.
 
 Your data stays in your own Cloudflare account.
+
+## Code signing policy
+
+Windows builds of the [Second Brain desktop app](installer/) are code-signed.
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+**Team and roles:**
+
+| Role | Members |
+| --- | --- |
+| Authors | [Rahil P (@rahilp)](https://github.com/rahilp) |
+| Reviewers | [Rahil P (@rahilp)](https://github.com/rahilp) |
+| Approvers | [Rahil P (@rahilp)](https://github.com/rahilp) |
+
+All release binaries are built from this repository's source by GitHub Actions ([installer-release.yml](.github/workflows/installer-release.yml)). Every signing request is reviewed and manually approved by an approver before a signed release is published.
+
+**Privacy statement:** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. Second Brain is self-hosted by design: during setup the desktop app talks to Cloudflare only to create resources inside *your own* Cloudflare account, and afterwards it communicates exclusively with your own private Second Brain. Your memories and credentials are never sent to the project maintainers or any other third party.
 
 ## Star History
 
