@@ -29,7 +29,7 @@ const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 // Worker version, echoed by GET /health. The desktop app compares this against
 // the version it bundles to offer a one-click "update your Second Brain".
 // Bump (semver) when the Worker changes; see installer/README "Worker versioning".
-export const SB_VERSION = "2.0.0";
+export const SB_VERSION = "2.0.5";
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
@@ -106,6 +106,8 @@ const D1_MAX_BOUND_PARAMS = 100;
 const RRF_K = 60;                    // Reciprocal Rank Fusion dampening constant
 const KEYWORD_CANDIDATE_LIMIT = 100; // max rows the LIKE keyword query scans
 const KEYWORD_MIN_TOKEN_LEN = 2;     // ignore 1-char tokens
+const QUERY_SATURATION_FRACTION = 0.3; // a query term in >30% of memories is non-discriminative for THIS brain → dropped before embedding
+const MAX_QUERY_TERMS = 3;             // embed at most the rarest N content terms so common words can't dilute the query
 const KEYWORD_STOPWORDS = new Set([
   "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are", "was", "were", "be", "been",
   "i", "me", "my", "we", "you", "it", "this", "that", "these", "those", "with", "about", "from", "at", "as", "by",
@@ -916,7 +918,24 @@ interface VectorizeMatch {
   id: string;
   score: number;
   metadata?: Record<string, unknown>;
+  values?: number[] | Float32Array | Float64Array; // present when the query/getByIds returned vectors (used by MMR)
 }
+
+// Recency-decay floors: the minimum fraction of its semantic relevance a memory
+// keeps regardless of age (applied in rerankWithTimeDecay). Because decay now
+// bottoms out at a floor instead of exp()-ing toward zero, recency becomes a
+// tie-breaker rather than a gate — a strong old match can no longer be buried
+// under a fresh weak one. Durability sets the floor: settled/important memories
+// barely fade, volatile tasks still do. Staleness is handled by status +
+// contradiction, not by making old memories invisible.
+export const RECENCY_FLOOR = 0.6;            // ordinary memories keep >= 60% (a clearly-stronger old match beats a weak fresh one)
+export const RECENCY_FLOOR_DURABLE = 0.9;    // canonical or importance >= 4 barely decay
+export const RECENCY_FLOOR_VOLATILE = 0.15;  // tasks fade hard (paired with the 7-day half-life)
+
+// MMR diversity: how much the final top-K trades relevance for variety. Higher =
+// more relevance-focused, lower = more diverse. 0.7 keeps the top hit intact while
+// stopping near-duplicate (usually recent) memories from taking every slot.
+export const MMR_LAMBDA = 0.7;
 
 export function getHalfLifeMs(tags: string[]): number {
   if (tags.includes("task")) return 7 * 24 * 60 * 60 * 1000;  // 7 days
@@ -959,9 +978,19 @@ export function rerankWithTimeDecay(
       const rc = recallCounts.get(parentId) ?? 0;
 
       const halfLifeMs = getHalfLifeMs(tags);
-      const recencyMultiplier = Math.exp(-ageMs / halfLifeMs);
-      // Frequency can compensate for recency loss but never push above a fresh entry (cap at 1.0).
-      // Without the cap, high recall counts overwhelm recency and bury newly-stored memories.
+      const imp = importanceScores.get(parentId) ?? 0;
+
+      // Recency ranks but never excludes. The decay bottoms out at a durability-aware
+      // floor: canonical decisions and high-importance memories barely fade, ordinary
+      // memories keep at least RECENCY_FLOOR of their relevance, and only volatile tasks
+      // decay hard (paired with their short half-life). A strong old match therefore
+      // stays in contention instead of being annihilated by exp() toward zero.
+      const recencyFloor =
+        getStatus(tags) === "canonical" || imp >= 4 ? RECENCY_FLOOR_DURABLE
+        : tags.includes("task") ? RECENCY_FLOOR_VOLATILE
+        : RECENCY_FLOOR;
+      const recencyMultiplier = recencyFloor + (1 - recencyFloor) * Math.exp(-ageMs / halfLifeMs);
+      // Frequency lifts often-recalled memories toward a fresh entry (still capped at 1.0).
       const frequencyMultiplier = 1 + Math.log1p(rc);
       const combinedMultiplier = Math.min(1.0, recencyMultiplier * frequencyMultiplier);
       const isShortAppend = match.id.includes("-update-") &&
@@ -973,7 +1002,6 @@ export function rerankWithTimeDecay(
       // Survivors (net wins) rise toward 5; repeatedly-contradicted memories (net losses)
       // fall toward 1. log1p gives diminishing returns; clamp keeps the effect inside the
       // existing 0.88–1.20 importance band. The stored importance_score is never mutated.
-      const imp = importanceScores.get(parentId) ?? 0;
       const wins = contradictionWins.get(parentId) ?? 0;
       const losses = contradictionLosses.get(parentId) ?? 0;
       const net = wins - losses;
@@ -995,6 +1023,41 @@ export function rerankWithTimeDecay(
       return { ...match, score: match.score * combinedMultiplier * appendPenalty * rolledUpPenalty * importanceMultiplier * tagBoost };
     })
     .sort((a, b) => b.score - a.score);
+}
+
+// Maximal Marginal Relevance: greedily pick a diverse top-K instead of taking the K
+// highest-scoring candidates. Taking the top K by score alone lets near-duplicate
+// (usually recent) memories fill every slot and crowd out distinct older ones. Each
+// pick maximizes  λ·relevance − (1−λ)·maxCosineSimilarityToAlreadyPicked.
+// Relevance is min-max normalized across the pool so it's on the same 0..1 scale as
+// the cosine redundancy term (the reranked score is on the RRF scale, not cosine).
+// Candidates without a vector (keyword-only hits) take no redundancy penalty — those
+// are exact-identifier matches we want to keep. The most-relevant item always seeds
+// the set, so the top result is unchanged; only the tail is diversified.
+export function mmrRerank<T extends VectorizeMatch>(candidates: T[], lambda: number, k: number): T[] {
+  if (candidates.length <= 1 || k <= 1) return candidates.slice(0, k);
+  const pool = [...candidates].sort((a, b) => b.score - a.score);
+  const maxRel = pool[0].score || 1;
+  const rel = (m: VectorizeMatch) => (maxRel > 0 ? m.score / maxRel : 0);
+
+  const selected: T[] = [pool.shift()!];
+  while (selected.length < k && pool.length) {
+    let bestIdx = 0;
+    let bestMmr = -Infinity;
+    for (let i = 0; i < pool.length; i++) {
+      const cand = pool[i];
+      let maxSim = 0;
+      if (cand.values) {
+        for (const s of selected) {
+          if (s.values) maxSim = Math.max(maxSim, cosineSim(cand.values, s.values));
+        }
+      }
+      const mmr = lambda * rel(cand) - (1 - lambda) * maxSim;
+      if (mmr > bestMmr) { bestMmr = mmr; bestIdx = i; }
+    }
+    selected.push(pool.splice(bestIdx, 1)[0]);
+  }
+  return selected;
 }
 
 // ─── Temporal phrase parsing ──────────────────────────────────────────────────
@@ -1199,7 +1262,7 @@ async function storeEntry(
       };
 
       tags.forEach(t => {
-        metadata[`tag_${t}`] = true;
+        metadata[`tag_${t.replace(/[."]/g, "_")}`] = true;
       });
 
       return {
@@ -1210,7 +1273,10 @@ async function storeEntry(
     })
   );
 
-  await env.VECTORIZE.insert(vectors);
+  // upsert (not insert): on update the re-embed of a single-chunk entry reuses
+  // the entry id, and Vectorize insert() silently skips ids that already exist —
+  // so insert would leave the stale embedding in place. upsert overwrites it.
+  await env.VECTORIZE.upsert(vectors);
 
   const vectorIds = vectors.map(v => v.id);
 
@@ -1227,8 +1293,23 @@ async function storeEntry(
 // id, so the re-embedded vector reuses the old id. Deleting the full old set
 // would remove the vector we just inserted, leaving the entry unsearchable.
 async function deleteStaleVectors(env: Env, oldIds: string[], newIds: string[]): Promise<void> {
+  // Guard (#212): an empty newIds means the re-embed produced nothing — it failed.
+  // Deleting every old vector would leave the entry unsearchable, so keep them instead.
+  // storeEntry always yields >= 1 vector for non-empty content, so this never fires on success.
+  if (!newIds.length) return;
   const stale = oldIds.filter(v => !newIds.includes(v));
   if (stale.length) await env.VECTORIZE.deleteByIds(stale);
+}
+
+// Re-embed BEFORE mutating the entry so a failed embed can never leave it
+// updated-but-unsearchable (#212). storeEntry writes the new vectors and updates
+// vector_ids; on throw or an empty result the caller must NOT touch D1 content or
+// delete old vectors — the entry stays intact and searchable. Callers surface the
+// failure to the user instead of reporting success.
+async function reembedOrThrow(env: Env, id: string, content: string, tags: string[], source: string): Promise<string[]> {
+  const ids = await storeEntry(env, id, content, tags, source, Date.now());
+  if (!ids.length) throw new Error("re-embed produced no vectors");
+  return ids;
 }
 
 // ─── Append to existing entry ─────────────────────────────────────────────────
@@ -1262,17 +1343,14 @@ async function appendToEntry(
     // Combined content is too large for a single vector — re-chunk everything.
     // Same safe ordering as update/merge/replace: insert new → delete old.
 
-    // Step 1: Persist full combined content to D1
+    // Step 1: Re-embed FIRST (#212). If it fails this throws, and the /append handler
+    // surfaces a 500 with the entry's content and vectors left intact — instead of
+    // committing new content and then deleting every vector (silently unsearchable).
+    const newVectorIds = await reembedOrThrow(env, id, newContent, tags, source);
+
+    // Step 2: Embed succeeded → persist the full combined content to D1.
     await env.DB.prepare(`UPDATE entries SET content = ? WHERE id = ?`)
       .bind(newContent, id).run();
-
-    // Step 2: Re-chunk + re-embed full content (also updates vector_ids in D1)
-    let newVectorIds: string[] = [];
-    try {
-      newVectorIds = await storeEntry(env, id, newContent, tags, source, Date.now());
-    } catch (e) {
-      console.error("Vectorize re-embed failed (non-fatal):", e);
-    }
 
     // Step 3: Delete only stale vectors — ids reused by the re-embed must survive
     try {
@@ -1307,7 +1385,7 @@ async function appendToEntry(
   };
 
   tags.forEach(t => {
-    metadata[`tag_${t}`] = true;
+    metadata[`tag_${t.replace(/[."]/g, "_")}`] = true;
   });
 
   await env.VECTORIZE.insert([{
@@ -1631,6 +1709,7 @@ export interface RecallSearchResult {
   // True when the dense (Vectorize) step could not run — recall fell back to
   // keyword-only. Lets callers tell the user semantic search is unavailable.
   semanticUnavailable: boolean;
+  queryUsed?: string; // the distilled query actually embedded (transparency + debugging)
 }
 
 // Render recall matches as the MCP tool's text reply. Crucially includes each entry's
@@ -1663,6 +1742,44 @@ export function tokenizeQuery(query: string): string[] {
       .map(t => t.replace(/^[^\w#.]+|[^\w#.]+$/g, "").replace(/[%_]/g, ""))
       .filter(t => t.length >= KEYWORD_MIN_TOKEN_LEN && !KEYWORD_STOPWORDS.has(t))
   )];
+}
+
+// Reduce a query to the terms that actually discriminate in THIS brain, in one data-driven
+// pass: strip grammatical stopwords, then from a single corpus document-frequency scan drop
+// terms that saturate the corpus (framing words like "user"/"wants" and topic-common words
+// like "second brain" are both common → dropped) and keep only the rarest MAX_QUERY_TERMS.
+// This replaces the old static framing wordlist + LLM rewrite: it needs no wordlist, no AI
+// call, and adapts to each brain automatically. Word order is preserved for the embedding.
+// Falls back to the content words (then the raw query) if the scan is unavailable.
+export async function distillToRareTerms(query: string, env: Env): Promise<string> {
+  const words = query.split(/\s+/).filter(Boolean);
+  const norm = (w: string) => w.toLowerCase().replace(/^[^\w#.]+|[^\w#.]+$/g, "");
+  const content = words.filter(w => {
+    const n = norm(w);
+    return n.length >= KEYWORD_MIN_TOKEN_LEN && !KEYWORD_STOPWORDS.has(n);
+  });
+  if (content.length <= 1) return content.length ? content.join(" ") : query;
+
+  const uniq = [...new Set(content.map(norm))].slice(0, 16);
+  try {
+    const sums = uniq.map((_, i) => `SUM(CASE WHEN content LIKE ? THEN 1 ELSE 0 END) AS d${i}`).join(", ");
+    const row = await env.DB.prepare(`SELECT COUNT(*) AS total, ${sums} FROM entries`)
+      .bind(...uniq.map(t => `%${t}%`)).first() as Record<string, number> | null;
+    if (!row || !row.total) return content.join(" ");
+    const total = row.total;
+    const df = new Map(uniq.map((t, i) => [t, (row[`d${i}`] as number) ?? 0]));
+    // Drop corpus-saturating terms; if that leaves nothing, keep all and let the cap decide.
+    let candidates = uniq.filter(t => (df.get(t) ?? 0) / total <= QUERY_SATURATION_FRACTION);
+    if (!candidates.length) candidates = uniq;
+    // Keep only the rarest MAX_QUERY_TERMS so common words can't dilute the query.
+    const keep = new Set(
+      [...candidates].sort((a, b) => (df.get(a) ?? 0) - (df.get(b) ?? 0)).slice(0, MAX_QUERY_TERMS)
+    );
+    const rebuilt = [...new Set(content.filter(w => keep.has(norm(w))))];
+    return rebuilt.length ? rebuilt.join(" ") : content.join(" ");
+  } catch {
+    return content.join(" ");
+  }
 }
 
 // Keyword candidates: entries whose content contains any query token, bounded by
@@ -1708,8 +1825,16 @@ function fuseDenseAndKeyword(
   }
   const denseRanked = [...denseByParent.keys()];
 
-  const keywordRanked = keywordRows
-    .map(r => ({ row: r, weight: tokens.reduce((n, t) => n + (r.content.toLowerCase().includes(t) ? 1 : 0), 0) }))
+  // IDF over the keyword candidate pool: a token matching few candidates (distinctive,
+  // e.g. an identifier or a rare noun) is worth far more than one matching many (a common
+  // word). Without this, a verbose query's common words outvote the rare token that
+  // actually pins the intent. Frequencies are derived from the data — nothing hardcoded.
+  const kwLower = keywordRows.map(r => ({ row: r, lc: r.content.toLowerCase() }));
+  const kwN = kwLower.length || 1;
+  const kwDf = new Map(tokens.map(t => [t, kwLower.reduce((n, x) => n + (x.lc.includes(t) ? 1 : 0), 0)]));
+  const kwIdf = (t: string) => Math.log(1 + kwN / ((kwDf.get(t) ?? 0) + 1));
+  const keywordRanked = kwLower
+    .map(x => ({ row: x.row, weight: tokens.reduce((s, t) => s + (x.lc.includes(t) ? kwIdf(t) : 0), 0) }))
     .filter(x => x.weight > 0 && (allowKeywordOnly || denseByParent.has(x.row.id)))
     .sort((a, b) => b.weight - a.weight || b.row.created_at - a.row.created_at || (a.row.id < b.row.id ? -1 : 1));
 
@@ -1720,7 +1845,7 @@ function fuseDenseAndKeyword(
   for (const [pid, score] of fused) {
     const dm = denseByParent.get(pid);
     if (dm) {
-      out.push({ id: dm.id, score, metadata: dm.metadata });
+      out.push({ id: dm.id, score, metadata: dm.metadata, values: dm.values });
     } else {
       const r = keywordRowById.get(pid)!;
       out.push({ id: pid, score, metadata: { parentId: pid, created_at: r.created_at, tags: JSON.parse(r.tags ?? "[]"), content: r.content, source: r.source } });
@@ -1730,11 +1855,12 @@ function fuseDenseAndKeyword(
 }
 
 export async function recallEntries(
-  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind; hops?: number },
+  params: { query: string; topK: number; tag?: string; after?: number; before?: number; kind?: MemoryKind; hops?: number; synthesize?: boolean },
   env: Env,
   ctx: ExecutionContext
 ): Promise<RecallSearchResult> {
   const { query, topK } = params;
+  const synthesize = params.synthesize ?? true;
   let { tag, after, before, kind } = params;
   const hops = Math.max(0, Math.min(GRAPH_MAX_HOPS, params.hops ?? 0));
   const now = Date.now();
@@ -1747,6 +1873,9 @@ export async function recallEntries(
     before = parsed.before;
     embedQuery = parsed.cleanQuery;
   }
+  // Reduce the query to the terms that actually discriminate in this brain (data-driven:
+  // strips framing + corpus-common words, keeps the rarest few) so it embeds on its subject.
+  embedQuery = await distillToRareTerms(embedQuery, env);
 
   const tokens = tokenizeQuery(embedQuery);
   const [values, queryTags] = await Promise.all([
@@ -1787,6 +1916,7 @@ export async function recallEntries(
         id: v.id,
         score: cosineSim(values, v.values as number[]),
         metadata: v.metadata,
+        values: v.values as number[],
       })) as VectorizeMatch[],
     };
   } else {
@@ -1795,7 +1925,7 @@ export async function recallEntries(
     const vectorizeTopK = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
     const denseQuery = async (): Promise<{ matches: VectorizeMatch[] }> => {
       try {
-        return await env.VECTORIZE.query(values, { topK: vectorizeTopK, returnMetadata: "all" });
+        return await env.VECTORIZE.query(values, { topK: vectorizeTopK, returnMetadata: "all", returnValues: true });
       } catch (e) {
         // This is the authoritative signal that the Vectorize index is unreachable —
         // semanticUnavailable drives the dashboard banner (checkVectorizeHealth/GET /health
@@ -1811,7 +1941,7 @@ export async function recallEntries(
 
     if (!semanticUnavailable && results.matches.length && results.matches[0].score < DUPLICATE_FLAG_THRESHOLD) {
       try {
-        results = await env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all" });
+        results = await env.VECTORIZE.query(values, { topK: 50, returnMetadata: "all", returnValues: true });
       } catch (e) {
         // Narrow query already succeeded with real matches, so the index works.
         // A transient widen failure must not claim semantic search is unavailable.
@@ -1847,12 +1977,16 @@ export async function recallEntries(
   const reranked = rerankWithTimeDecay(fusedMatches, recallCounts, importanceScores, queryTags, contradictionWins, contradictionLosses);
 
   const seen = new Set<string>();
-  const deduped = reranked.filter((m) => {
+  const dedupedAll = reranked.filter((m) => {
     const parentId = (m.metadata as any)?.parentId ?? m.id;
     if (seen.has(parentId)) return false;
     seen.add(parentId);
     return true;
-  }).slice(0, topK);
+  });
+  // Diversity: MMR-select the top-K so near-duplicate (usually recent) memories can't
+  // take every slot and bury distinct older ones. The top hit is preserved; the tail
+  // is diversified. Reduces to top-K-by-score when there's nothing to diversify.
+  const deduped = mmrRerank(dedupedAll, MMR_LAMBDA, topK);
 
   if (!deduped.length) return { matches: [], insight: "", semanticUnavailable };
 
@@ -1950,8 +2084,10 @@ export async function recallEntries(
   if (maxScore > 0) for (const m of matches) m.score = m.score / maxScore;
 
   // Synthesize over exactly what's shown (seeds + any surfaced neighbors) so the
-  // insight stays grounded in the returned results.
-  const insight = matches.length > 1
+  // insight stays grounded in the returned results. Skipped when the caller opts
+  // out (synthesize=false): MCP clients re-synthesize the returned memories with
+  // their own model, so a server-side insight there is a redundant LLM call.
+  const insight = synthesize && matches.length > 1
     ? await synthesizeInsight(embedQuery, matches.map(m => ({ id: m.id, content: m.content })), env)
     : "";
 
@@ -1962,7 +2098,7 @@ export async function recallEntries(
     );
   }
 
-  return { matches, insight, semanticUnavailable };
+  return { matches, insight, semanticUnavailable, queryUsed: embedQuery };
 }
 
 // ─── Shared write path ────────────────────────────────────────────────────────
@@ -2034,26 +2170,32 @@ export async function captureEntry(
         return { status: "flagged", id: crypto.randomUUID(), matchId: targetId, score: dup.score };
       }
 
-      // Step 1: Update D1 content
-      await env.DB.prepare(`UPDATE entries SET content = ? WHERE id = ?`).bind(newContent, targetId).run();
-
-      // Step 2: Re-embed new content — inserts new vectors, updates vector_ids in D1
-      let newVectorIds: string[] = [];
+      // Re-embed FIRST (#212): if it fails, leave the merge target completely
+      // untouched and fall through to a normal insert (keep_both, recoverable) —
+      // instead of overwriting its content and then deleting its vectors, which
+      // would silently destroy the target's searchability.
+      let newVectorIds: string[] | null = null;
       try {
-        newVectorIds = await storeEntry(env, targetId, newContent, existingTags, existingSource, Date.now());
-      } catch (e) { console.error("Vectorize re-embed failed (non-fatal):", e); }
+        newVectorIds = await reembedOrThrow(env, targetId, newContent, existingTags, existingSource);
+      } catch (e) {
+        console.error("Merge re-embed failed — keeping both, target untouched:", e);
+      }
 
-      // Step 3: Delete only stale vectors — ids reused by the re-embed must survive
-      try {
-        await deleteStaleVectors(env, oldVectorIds, newVectorIds);
-      } catch (e) { console.error("Old vector cleanup failed (non-fatal):", e); }
+      if (newVectorIds) {
+        // Embed succeeded → commit the merge onto the target.
+        await env.DB.prepare(`UPDATE entries SET content = ? WHERE id = ?`).bind(newContent, targetId).run();
+        try {
+          await deleteStaleVectors(env, oldVectorIds, newVectorIds);
+        } catch (e) { console.error("Old vector cleanup failed (non-fatal):", e); }
 
-      // Re-classify the merged/replaced content — updates importance_score + kind (and canonical if warranted) on the target.
-      scheduleClassifyAndTag(targetId, newContent, env, ctx);
+        // Re-classify the merged/replaced content — updates importance_score + kind (and canonical if warranted) on the target.
+        scheduleClassifyAndTag(targetId, newContent, env, ctx);
 
-      return mergeAction.action === "merge"
-        ? { status: "merged", id: targetId }
-        : { status: "replaced", id: targetId };
+        return mergeAction.action === "merge"
+          ? { status: "merged", id: targetId }
+          : { status: "replaced", id: targetId };
+      }
+      // Re-embed failed → fall through to the normal insert below (keep_both).
     }
     // target not found in DB — fall through to normal insert
   }
@@ -2298,7 +2440,7 @@ async function runScheduledIntegrationSync(env: Env): Promise<void> {
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
 
-function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
+export function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
   const server = new McpServer({ name: "second-brain", version: "1.0.0" });
 
   // ── remember ────────────────────────────────────────────────────────────
@@ -2482,7 +2624,7 @@ function buildMcpServer(env: Env, ctx: ExecutionContext): McpServer {
       },
     },
     async ({ query, topK, tag, after, before, kind, hops }) => {
-      const { matches, insight, semanticUnavailable } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops }, env, ctx);
+      const { matches, insight, semanticUnavailable } = await recallEntries({ query, topK, tag, after, before, kind: kind as MemoryKind | undefined, hops, synthesize: false }, env, ctx);
 
       const notice = semanticUnavailable
         ? `Note: semantic search is unavailable because the Vectorize index is missing, so these are keyword matches only. Fix: ${VECTORIZE_FIX_HINT}.\n\n`
@@ -2871,16 +3013,20 @@ const defaultHandler = {
       const oldVectorIds: string[] = JSON.parse(row.vector_ids ?? "[]");
       const finalContent = cleanContent || newContent;
 
+      // Re-embed FIRST (#212): if it fails, leave the entry's content and vectors
+      // untouched and surface an error, instead of committing new content and then
+      // deleting every vector — which would leave the entry silently unsearchable.
+      let newVectorIds: string[];
+      try {
+        newVectorIds = await reembedOrThrow(env, id, finalContent, mergedTags, source);
+      } catch (e) {
+        console.error("Re-embed failed — entry left unchanged:", e);
+        return json({ ok: false, error: "Couldn't update: search re-index failed. Your memory is unchanged — please try again." }, 500);
+      }
+
+      // Embed succeeded → safe to commit the new content and retire stale vectors.
       await env.DB.prepare(`UPDATE entries SET content = ?, tags = ? WHERE id = ?`)
         .bind(finalContent, JSON.stringify(mergedTags), id).run();
-
-      let newVectorIds: string[] = [];
-      try {
-        newVectorIds = await storeEntry(env, id, finalContent, mergedTags, source, Date.now());
-      } catch (e) {
-        console.error("Vectorize re-embed failed (non-fatal):", e);
-      }
-      const newVectorCount = newVectorIds.length;
 
       try {
         await deleteStaleVectors(env, oldVectorIds, newVectorIds);
@@ -2888,7 +3034,7 @@ const defaultHandler = {
         console.error("Old vector cleanup failed (non-fatal):", e);
       }
 
-      return json({ ok: true, id, vectors: newVectorCount });
+      return json({ ok: true, id, vectors: newVectorIds.length });
     }
 
     // GET /count
@@ -3037,12 +3183,13 @@ const defaultHandler = {
       const kind = kindParam && (KIND_VALUES as readonly string[]).includes(kindParam) ? kindParam as MemoryKind : undefined;
       const hops = Math.min(Math.max(parseInt(url.searchParams.get("hops") ?? "0", 10), 0), 3);
 
-      const { matches, insight, semanticUnavailable } = await recallEntries({ query, topK, tag, after, before, kind, hops }, env, ctx);
+      const { matches, insight, semanticUnavailable, queryUsed } = await recallEntries({ query, topK, tag, after, before, kind, hops }, env, ctx);
 
       if (!matches.length) {
         return json({
           ok: true,
           results: [],
+          query_used: queryUsed,
           semantic_unavailable: semanticUnavailable,
           message: semanticUnavailable
             ? `Semantic search unavailable (Vectorize index missing). Fix: ${VECTORIZE_FIX_HINT}.`
@@ -3052,6 +3199,7 @@ const defaultHandler = {
 
       return json({
         ok: true,
+        query_used: queryUsed,
         results: matches.map(m => ({
           id: m.id,
           content: m.content,

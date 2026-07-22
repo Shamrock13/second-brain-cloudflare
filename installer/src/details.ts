@@ -10,7 +10,7 @@ import {
   emailButton,
   h,
 } from "./shared";
-import { toolRows } from "./shared";
+import { integrationRows, toolRows } from "./shared";
 import "./style.css";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -43,13 +43,19 @@ async function boot() {
       ...detailCards(details),
       h("div", { class: "actions-spread" }, [copyBothButton(details), emailButton(details)]),
       h("div", { style: "height:18px" }),
-      h("div", { class: "url-label" }, ["Connect a new tool"]),
+      h("div", { class: "url-label" }, ["Connect your AI tools"]),
       h("div", { class: "url-desc" }, [
         "Tools on this computer connect with one click. For anything else, " +
           "paste your connection link into the tool's connector settings — " +
           "it will ask for your password the first time.",
       ]),
       toolRows(details, tools),
+      h("div", { style: "height:18px" }),
+      h("div", { class: "url-label" }, ["Integrations"]),
+      h("div", { class: "url-desc" }, [
+        "Bring in notes and pages from the tools you already use.",
+      ]),
+      integrationRows(details),
       logoutSection(),
     ]),
   );
