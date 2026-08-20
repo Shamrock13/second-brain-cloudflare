@@ -169,11 +169,9 @@ describe("recall stays inside D1's statement limits", () => {
   });
 
   describe("the hydration id list", () => {
-    // Today this list cannot outgrow one statement: the route and the MCP tool
-    // both clamp topK to 20, and expandGraph stops at GRAPH_MAX_NODES (50), so
-    // the worst case is 70 ids. recallEntries itself does not clamp, so calling
-    // it directly is the honest way to ask what the query does when the list
-    // does outgrow one statement — which is one constant in another file away.
+    // Direct recall can exceed the public topK cap when recallEntries is called
+    // internally, while graph-aware recall can hydrate 50 candidate roots plus
+    // 50 expanded nodes. Both paths must leave room for shared filter bindings.
     const N = 150;
     const ids = Array.from({ length: N }, (_, i) => `e${i}`);
 
@@ -235,6 +233,42 @@ describe("recall stays inside D1's statement limits", () => {
       expect(matches.length).toBe(N);
       const hydration = hydrationStatements(executed);
       expect(hydration.map(h => h.params.length)).toEqual([100, 54]);
+      expect(Math.max(...hydration.map(h => h.params.length))).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
+    });
+
+    it("chunks the maximum graph-root plus expanded-node union with time filters", async () => {
+      const roots = Array.from({ length: 50 }, (_, i) => `root-${i}`);
+      const neighbors = Array.from({ length: 50 }, (_, i) => `neighbor-${i}`);
+      for (const [i, id] of roots.entries()) {
+        sqlite.seed({ id, content: `topic0 decision root ${i}`, createdAt: 1000 + i });
+        sqlite.seed({ id: neighbors[i], content: `linked evidence ${i}`, createdAt: 1000 + i });
+        await sqlite.db.prepare(
+          `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(`edge-${i}`, id, neighbors[i], "decided", 1, "explicit", "{}", 1, 1).run();
+      }
+      const env = envWith(undefined, {
+        VECTORIZE: makeVectorizeMock({
+          query: vi.fn().mockResolvedValue({
+            matches: roots.map((id, i) => ({
+              id,
+              score: 1 - i / 100,
+              metadata: { parentId: id, created_at: 1000 + i },
+            })),
+          }),
+        }),
+      });
+
+      const { matches } = await recallEntries(
+        { query: "topic0", topK: 20, hops: 1, after: 900, before: 2000, synthesize: false },
+        env,
+        ctx,
+      );
+
+      expect(matches).toHaveLength(20);
+      expect(new Set(matches.map(m => m.id)).size).toBe(20);
+      const hydration = hydrationStatements(executed);
+      expect(hydration.map(h => h.params.length)).toEqual([100, 4]);
       expect(Math.max(...hydration.map(h => h.params.length))).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
     });
   });

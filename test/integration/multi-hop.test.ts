@@ -134,13 +134,38 @@ describe("multi-hop recall (issue #16)", () => {
       ...[0, 1, 2, 3, 4].map(i => ({ id: `direct-${i}`, score: 0.95 - i * 0.04 })),
       { id: "candidate-root", score: 0.7 },
     ]);
-    const { ctx } = makeCtx();
+    const { ctx, drain } = makeCtx();
 
     const res = await recallEntries({ query: "why anniversary changed", topK: 5, hops: 1, synthesize: false }, env, ctx);
+    await drain();
 
     expect(res.matches).toHaveLength(5);
     expect(res.matches[0].id).toBe("direct-0");
     expect(res.matches.map(m => m.id)).toContain("linked-answer");
     expect(res.matches.find(m => m.id === "linked-answer")?.viaFrom).toBe("candidate-root");
+    expect(db.entries.find((e: any) => e.id === "direct-0").recall_count).toBe(1);
+    expect(db.entries.find((e: any) => e.id === "direct-4").recall_count).toBe(0);
+    expect(db.entries.find((e: any) => e.id === "candidate-root").recall_count).toBe(0);
+    expect(db.entries.find((e: any) => e.id === "linked-answer").recall_count).toBe(0);
+  });
+
+  it("uses the same Workers AI models with and without graph traversal", async () => {
+    const directDb = makeTestDb();
+    seed(directDb, "seed", "Direct match");
+    seed(directDb, "neighbor", "Related context");
+    pushEdge(directDb, "seed", "neighbor");
+    const graphDb = makeTestDb();
+    seed(graphDb, "seed", "Direct match");
+    seed(graphDb, "neighbor", "Related context");
+    pushEdge(graphDb, "seed", "neighbor");
+    const directEnv = denseEnv(directDb, [{ id: "seed", score: 0.9 }]);
+    const graphEnv = denseEnv(graphDb, [{ id: "seed", score: 0.9 }]);
+
+    await recallEntries({ query: "direct", topK: 5, hops: 0, synthesize: false }, directEnv, makeCtx().ctx);
+    await recallEntries({ query: "direct", topK: 5, hops: 1, synthesize: false }, graphEnv, makeCtx().ctx);
+
+    const models = (testEnv: Env) => (testEnv.AI.run as ReturnType<typeof vi.fn>).mock.calls.map(call => call[0]);
+    expect(models(graphEnv)).toEqual(models(directEnv));
+    expect(models(graphEnv)).toEqual(["@cf/baai/bge-small-en-v1.5"]);
   });
 });
