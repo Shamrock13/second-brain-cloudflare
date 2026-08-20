@@ -37,7 +37,7 @@ function compareBy(
 function allocateQuotas(available: RootView[], limit: number): Map<RootView, number> {
   const quotas = new Map<RootView, number>();
   for (const view of available) {
-    quotas.set(view, Math.max(1, Math.floor(limit * VIEW_SHARE[view])));
+    quotas.set(view, Math.floor(limit * VIEW_SHARE[view]));
   }
 
   let remaining = limit - [...quotas.values()].reduce((sum, quota) => sum + quota, 0);
@@ -48,6 +48,19 @@ function allocateQuotas(available: RootView[], limit: number): Map<RootView, num
   for (let index = 0; remaining > 0; index = (index + 1) % byRemainder.length, remaining--) {
     const view = byRemainder[index];
     quotas.set(view, (quotas.get(view) ?? 0) + 1);
+  }
+
+  // The fixed-share allocation can leave a non-empty view at zero (for example,
+  // 40/30/15/15 at a four-root budget). Reserve every view by transferring only
+  // surplus seats, preserving the fixed limit and all one-seat reservations.
+  for (const view of available) {
+    if (quotas.get(view) !== 0) continue;
+    const donor = available
+      .filter(candidate => (quotas.get(candidate) ?? 0) > 1)
+      .sort((a, b) => (quotas.get(b) ?? 0) - (quotas.get(a) ?? 0) || VIEWS.indexOf(a) - VIEWS.indexOf(b))[0];
+    if (!donor) break;
+    quotas.set(donor, (quotas.get(donor) ?? 0) - 1);
+    quotas.set(view, 1);
   }
   return quotas;
 }
@@ -70,14 +83,16 @@ export function selectGraphRoots(
   const quotas = allocateQuotas(available, limit);
   const selected: SelectedRoot[] = [];
   const selectedIds = new Set<string>();
+  const selectedByView = new Map<RootView, number>();
 
   for (const view of available) {
     const quota = quotas.get(view) ?? 0;
     for (const candidate of views[view]) {
-      if (selected.length >= limit || selected.filter(root => root.selectedBy === view).length >= quota) break;
+      if (selected.length >= limit || (selectedByView.get(view) ?? 0) >= quota) break;
       if (selectedIds.has(candidate.parentId)) continue;
       selected.push({ candidate, selectedBy: view });
       selectedIds.add(candidate.parentId);
+      selectedByView.set(view, (selectedByView.get(view) ?? 0) + 1);
     }
   }
 

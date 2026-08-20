@@ -76,8 +76,8 @@ describe("selectGraphRoots", () => {
     ], 6, 0.7);
 
     expect(selected.filter(x => x.selectedBy === "semantic")).toHaveLength(2);
-    expect(selected.filter(x => x.selectedBy === "lexical")).toHaveLength(1);
-    expect(selected.filter(x => x.selectedBy === "metadata")).toHaveLength(2);
+    expect(selected.filter(x => x.selectedBy === "lexical")).toHaveLength(2);
+    expect(selected.filter(x => x.selectedBy === "metadata")).toHaveLength(1);
     expect(selected.filter(x => x.selectedBy === "diversity")).toHaveLength(1);
   });
 });
