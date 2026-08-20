@@ -141,6 +141,12 @@ function bestMatchWindow(text: string, tokens: string[], width: number): string 
   return text.slice(start, start + width).replace(/^\S*\s+/, "");
 }
 
+export function queryRelevantWindow(content: string, queryTokens: string[], maxChars = 400): string {
+  const raw = (content ?? "").trim();
+  if (raw.length <= maxChars) return raw;
+  return bestMatchWindow(raw, queryTokens, maxChars) ?? cutOnBoundary(raw, maxChars);
+}
+
 // The most recent `[Update …]` block of an append-grown entry, if any.
 function latestUpdateBlock(text: string): string | null {
   const at = text.lastIndexOf(UPDATE_MARKER);
