@@ -111,4 +111,36 @@ describe("multi-hop recall (issue #16)", () => {
     expect(res.matches).toHaveLength(5);
     expect(res.matches.map(m => m.id)).not.toContain("neighbor"); // direct matches fill topK
   });
+
+  it("surfaces relevant linked evidence from a root just outside direct topK", async () => {
+    for (let i = 0; i < 5; i++) {
+      seed(db, `direct-${i}`, `why anniversary changed distraction ${i}`);
+      (db.entries.at(-1) as any).created_at = 2000 - i;
+    }
+    seed(db, "candidate-root", "why anniversary changed because the original trip was impractical");
+    seed(db, "linked-answer", "Chateau Elan solved the sitter constraint");
+    db.edges.push({
+      id: "candidate-answer",
+      source_id: "candidate-root",
+      target_id: "linked-answer",
+      type: "decided",
+      weight: 1,
+      provenance: "explicit",
+      metadata: "{}",
+      created_at: 1,
+      updated_at: 1,
+    });
+    const env = denseEnv(db, [
+      ...[0, 1, 2, 3, 4].map(i => ({ id: `direct-${i}`, score: 0.95 - i * 0.04 })),
+      { id: "candidate-root", score: 0.7 },
+    ]);
+    const { ctx } = makeCtx();
+
+    const res = await recallEntries({ query: "why anniversary changed", topK: 5, hops: 1, synthesize: false }, env, ctx);
+
+    expect(res.matches).toHaveLength(5);
+    expect(res.matches[0].id).toBe("direct-0");
+    expect(res.matches.map(m => m.id)).toContain("linked-answer");
+    expect(res.matches.find(m => m.id === "linked-answer")?.viaFrom).toBe("candidate-root");
+  });
 });

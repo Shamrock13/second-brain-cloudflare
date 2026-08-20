@@ -8,7 +8,7 @@ import {
 import { resolveConfig, type Config } from "../config";
 import { embed } from "../lib/ai";
 import { expandGraph } from "../graph/traverse";
-import type { EdgeProvenance, EdgeType } from "../graph/types";
+import type { GraphNeighbor } from "../graph/types";
 import { KIND_VALUES, type MemoryKind } from "../memory/kind";
 import { parseTimePhrase } from "../text/temporal";
 import { tokenizeQuery } from "../text/tokenize";
@@ -18,6 +18,7 @@ import { hasStaleAsOf } from "../memory/stale";
 import { cosineSim, mmrRerank, rerankWithTimeDecay, type VectorizeMatch } from "./math";
 import { rrfFuse } from "./rrf";
 import { computeCompoundStale } from "./compound-stale";
+import { graphSeedLimit, relatedSlotLimit, scoreLinkedEvidence } from "./neighborhood";
 import type { KeywordRow, RecallMatch, RecallSearchResult } from "./types";
 import { TAG_LIKE_ESCAPE, tagLikePattern } from "../memory/tag-sql";
 
@@ -226,35 +227,30 @@ export async function recallEntries(
     seen.add(parentId);
     return true;
   });
-  const deduped = mmrRerank(dedupedAll, cfg.MMR_LAMBDA, topK);
+  const directCandidates = mmrRerank(dedupedAll, cfg.MMR_LAMBDA, topK);
 
-  if (!deduped.length) return { matches: [], insight: "", semanticUnavailable };
+  if (!directCandidates.length) return { matches: [], insight: "", semanticUnavailable };
 
-  const seedParentIds = deduped.map((m) => (m.metadata as any)?.parentId ?? m.id);
+  const directParentIds = directCandidates.map((m) => (m.metadata as any)?.parentId ?? m.id);
+  const graphCandidates = hops > 0
+    ? mmrRerank(dedupedAll, cfg.MMR_LAMBDA, graphSeedLimit(topK, dedupedAll.length))
+    : directCandidates;
+  const graphSeedIds = graphCandidates.map((m) => (m.metadata as any)?.parentId ?? m.id);
 
-  let expandedScored: { parentId: string; score: number; hop: number; viaProvenance: EdgeProvenance; viaType: EdgeType; viaLinkedAt: number; viaFrom: string }[] = [];
+  let expanded: GraphNeighbor[] = [];
   if (hops > 0) {
-    const minSeedScore = deduped.reduce((mn, m) => Math.min(mn, m.score), Infinity);
-    const expanded = await expandGraph(seedParentIds, { hops }, env, cfg);
-    expandedScored = expanded.map(n => ({
-      parentId: n.id,
-      hop: n.hop,
-      score: minSeedScore * Math.pow(cfg.GRAPH_HOP_DECAY, n.hop) * n.viaWeight,
-      viaProvenance: n.viaProvenance,
-      viaType: n.viaType,
-      viaLinkedAt: n.viaLinkedAt,
-      viaFrom: n.viaFrom,
-    }));
+    expanded = await expandGraph(graphSeedIds, { hops }, env, cfg);
   }
 
-  // Chunked like the recall-count fetch above. This id list is the seeds plus
-  // whatever the graph expansion returned, so its length is the sum of two caps
-  // this query does not own — topK and GRAPH_MAX_NODES. They sum to 70 today,
-  // which fits one statement; the loop is what makes raising either of them a
-  // tuning change here rather than a query D1 rejects. One consequence if a
-  // second batch ever runs: d1Rows is then batch order, not one result set's
-  // order — worth knowing if a future consumer relies on that ordering.
-  const allParentIds = [...seedParentIds, ...expandedScored.map(e => e.parentId)];
+  // The graph view can include up to 50 roots and 50 expanded nodes in addition
+  // to direct candidates. Keep the union unique and chunked: with a topK above
+  // the public route's cap this can span multiple D1 statements, and time
+  // filters consume bindings in every statement.
+  const allParentIds = [...new Set([
+    ...directParentIds,
+    ...graphSeedIds,
+    ...expanded.map(e => e.id),
+  ])];
   let d1Filters = ` AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%'`;
   const filterBindings: number[] = [];
   if (kind && (KIND_VALUES as readonly string[]).includes(kind)) {
@@ -275,16 +271,7 @@ export async function recallEntries(
 
   const d1Map = new Map(d1Rows.map((r) => [r.id as string, r]));
 
-  const seedIdSet = new Set(seedParentIds);
-  ctx.waitUntil(
-    Promise.all(
-      [...d1Map.keys()].filter(id => seedIdSet.has(id)).map(id =>
-        env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`).bind(id).run()
-      )
-    ).catch(e => console.error("recall_count update failed (non-fatal):", e))
-  );
-
-  const seedMatches: RecallMatch[] = deduped.flatMap((m) => {
+  const directMatches: RecallMatch[] = directCandidates.flatMap((m) => {
     const meta = m.metadata as Record<string, any>;
     const parentId = (meta?.parentId ?? m.id) as string;
     const row = d1Map.get(parentId);
@@ -303,30 +290,80 @@ export async function recallEntries(
     }];
   });
 
-  const expandedMatches: RecallMatch[] = expandedScored.flatMap((e) => {
-    const row = d1Map.get(e.parentId);
+  const graphSeedScores = new Map(graphCandidates.map(m => [
+    ((m.metadata as any)?.parentId ?? m.id) as string,
+    m.score,
+  ]));
+  const rootScoreByNode = new Map(graphSeedScores);
+  const expandedMatches: { match: RecallMatch; eligible: boolean }[] = expanded.flatMap((e) => {
+    const row = d1Map.get(e.id);
     if (!row) return [];
-    return [{
-      id: e.parentId,
+    const parentRow = d1Map.get(e.viaFrom);
+    const rootScore = rootScoreByNode.get(e.viaFrom)
+      ?? graphSeedScores.get(e.viaFrom)
+      ?? directCandidates.at(-1)?.score
+      ?? 0;
+    rootScoreByNode.set(e.id, rootScore);
+    const evidence = scoreLinkedEvidence({
+      parentScore: rootScore,
+      parentContent: (parentRow?.content as string | undefined) ?? "",
       content: row.content as string,
-      score: e.score,
-      createdAt: row.created_at as number,
-      updatedAt: (row.updated_at as number | null) ?? (row.created_at as number),
-      tags: JSON.parse(row.tags ?? "[]"),
-      source: row.source as string,
-      isUpdate: false,
+      queryTokens: tokens,
+      corpus: distilled,
       hop: e.hop,
-      staleAsOf: hasStaleAsOf(JSON.parse(row.tags ?? "[]")),
-      viaProvenance: e.viaProvenance,
-      viaType: e.viaType,
-      viaLinkedAt: e.viaLinkedAt,
-      viaFrom: e.viaFrom,
+      edgeWeight: e.viaWeight,
+      provenance: e.viaProvenance,
+      hopDecay: cfg.GRAPH_HOP_DECAY,
+    });
+    const structuralScore = rootScore
+      * Math.pow(cfg.GRAPH_HOP_DECAY, e.hop)
+      * e.viaWeight
+      * 0.5;
+    return [{
+      eligible: evidence.eligible,
+      match: {
+        id: e.id,
+        content: row.content as string,
+        score: evidence.eligible ? evidence.score : structuralScore,
+        createdAt: row.created_at as number,
+        updatedAt: (row.updated_at as number | null) ?? (row.created_at as number),
+        tags: JSON.parse(row.tags ?? "[]"),
+        source: row.source as string,
+        isUpdate: false,
+        hop: e.hop,
+        staleAsOf: hasStaleAsOf(JSON.parse(row.tags ?? "[]")),
+        viaProvenance: e.viaProvenance,
+        viaType: e.viaType,
+        viaLinkedAt: e.viaLinkedAt,
+        viaFrom: e.viaFrom,
+      },
     }];
   });
 
-  const matches: RecallMatch[] = [...seedMatches, ...expandedMatches]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
+  const sortedExpanded = expandedMatches
+    .sort((a, b) => b.match.score - a.match.score || a.match.id.localeCompare(b.match.id));
+  let selectedDirect: RecallMatch[];
+  let selectedRelated: RecallMatch[];
+  if (directMatches.length < topK) {
+    selectedDirect = directMatches;
+    selectedRelated = sortedExpanded.slice(0, topK - directMatches.length).map(e => e.match);
+  } else {
+    selectedRelated = sortedExpanded
+      .filter(e => e.eligible)
+      .slice(0, relatedSlotLimit(topK))
+      .map(e => e.match);
+    selectedDirect = directMatches.slice(0, topK - selectedRelated.length);
+  }
+  const matches: RecallMatch[] = [...selectedDirect, ...selectedRelated];
+
+  const presentedDirectIds = new Set(selectedDirect.map(m => m.id));
+  ctx.waitUntil(
+    Promise.all(
+      [...presentedDirectIds].map(id =>
+        env.DB.prepare(`UPDATE entries SET recall_count = recall_count + 1 WHERE id = ?`).bind(id).run()
+      )
+    ).catch(e => console.error("recall_count update failed (non-fatal):", e))
+  );
 
   const maxScore = matches.reduce((mx, m) => Math.max(mx, m.score), 0);
   if (maxScore > 0) for (const m of matches) m.score = m.score / maxScore;
