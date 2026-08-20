@@ -1,8 +1,21 @@
 import { VECTORIZE_TOP_K_MULTIPLIER } from "../constants";
-import type { EdgeProvenance } from "../graph/types";
+import type { EdgeProvenance, EdgeType } from "../graph/types";
 import type { DistilledQuery } from "./distill";
+import { edgeIntentCompatibility, type RecallIntent } from "./query-profile";
 
 const SUBSTRING_WEIGHT = 0.25;
+const WEIGHT = {
+  root: 0.30,
+  linkedCoverage: 0.25,
+  unionCoverage: 0.20,
+  coverageGain: 0.10,
+  edge: 0.05,
+  provenance: 0.05,
+  intent: 0.05,
+} as const;
+const MIN_NEIGHBORHOOD_SCORE = 0.5;
+const MIN_EVIDENCE_GAIN = 0.1;
+const MIN_LINKED_COVERAGE = 0.2;
 
 export interface LinkedEvidenceInput {
   parentScore: number;
@@ -14,11 +27,17 @@ export interface LinkedEvidenceInput {
   edgeWeight: number;
   provenance: EdgeProvenance;
   hopDecay: number;
+  replacementCoverage: number;
+  intent: RecallIntent;
+  edgeType: EdgeType;
 }
 
-export interface LinkedEvidenceScore {
+export interface NeighborhoodEvidenceScore {
   eligible: boolean;
   score: number;
+  coverage: number;
+  coverageGain: number;
+  rejection?: "no-linked-evidence" | "weak-neighborhood" | "no-evidence-gain";
 }
 
 export function graphSeedLimit(topK: number, candidateCount: number): number {
@@ -32,13 +51,18 @@ export function relatedSlotLimit(topK: number): number {
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-function weightedCoverage(
+export interface CoverageDetail {
+  score: number;
+  exactHighIdf: boolean;
+}
+
+export function queryCoverage(
   content: string,
   tokens: string[],
   corpus: Pick<DistilledQuery, "df" | "total">,
-): number {
+): CoverageDetail {
   const normalizedTokens = [...new Set(tokens.map(t => t.toLowerCase()).filter(Boolean))];
-  if (!normalizedTokens.length) return 0;
+  if (!normalizedTokens.length) return { score: 0, exactHighIdf: false };
 
   const hasCorpusIdf = !!corpus.df && !!corpus.total && normalizedTokens.every(t => corpus.df!.has(t));
   const weightOf = (token: string) => hasCorpusIdf
@@ -47,45 +71,79 @@ function weightedCoverage(
   const lower = content.toLowerCase();
   let matched = 0;
   let total = 0;
+  let exactHighIdf = false;
 
   for (const token of normalizedTokens) {
     const weight = weightOf(token);
     total += weight;
-    if (new RegExp(`(?<![\\w])${escapeRegExp(token)}(?![\\w])`).test(lower)) {
+    const isExactMatch = new RegExp(`(?<![\\w])${escapeRegExp(token)}(?![\\w])`).test(lower);
+    if (isExactMatch) {
       matched += weight;
+      exactHighIdf ||= !!corpus.df
+        && !!corpus.total
+        && (corpus.df.get(token) ?? Number.POSITIVE_INFINITY) <= corpus.total * 0.1;
     } else if (lower.includes(token)) {
       matched += weight * SUBSTRING_WEIGHT;
     }
   }
 
-  return total > 0 ? matched / total : 0;
+  return { score: total > 0 ? matched / total : 0, exactHighIdf };
 }
 
-export function scoreLinkedEvidence(input: LinkedEvidenceInput): LinkedEvidenceScore {
-  const parentCoverage = weightedCoverage(input.parentContent, input.queryTokens, input.corpus);
-  const linkedCoverage = weightedCoverage(input.content, input.queryTokens, input.corpus);
-  const unionCoverage = weightedCoverage(
+const clamp = (value: number) => Math.max(0, Math.min(1, value));
+
+function exactMatchCount(content: string, tokens: string[]): number {
+  const lower = content.toLowerCase();
+  return new Set(tokens.map(t => t.toLowerCase()).filter(Boolean)).size === 0
+    ? 0
+    : [...new Set(tokens.map(t => t.toLowerCase()).filter(Boolean))]
+      .filter(token => new RegExp(`(?<![\\w])${escapeRegExp(token)}(?![\\w])`).test(lower)).length;
+}
+
+export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvidenceScore {
+  const parentCoverage = queryCoverage(input.parentContent, input.queryTokens, input.corpus).score;
+  const linked = queryCoverage(input.content, input.queryTokens, input.corpus);
+  const unionCoverage = queryCoverage(
     `${input.parentContent}\n${input.content}`,
     input.queryTokens,
     input.corpus,
-  );
-  const eligible = linkedCoverage > 0;
-  if (!eligible) return { eligible: false, score: 0 };
+  ).score;
+  const linkedCoverage = linked.score;
+  const coverageGain = Math.max(0, unionCoverage - parentCoverage);
+  if (linkedCoverage === 0) {
+    return { eligible: false, score: 0, coverage: linkedCoverage, coverageGain, rejection: "no-linked-evidence" };
+  }
+
+  const hasPreciseLinkedEvidence = linked.exactHighIdf || exactMatchCount(input.content, input.queryTokens) >= 2;
+  const rootRelevance = clamp(input.parentScore * Math.pow(clamp(input.hopDecay), input.hop));
 
   const provenanceFactor = input.provenance === "explicit"
     ? 1
     : input.provenance === "system"
       ? 0.9
       : 0.8;
-  const coverageGain = Math.max(0, unionCoverage - parentCoverage);
-  const evidenceFactor = 0.5 + 0.3 * linkedCoverage + 0.2 * coverageGain;
+  const score = clamp(
+    WEIGHT.root * rootRelevance
+    + WEIGHT.linkedCoverage * clamp(linkedCoverage)
+    + WEIGHT.unionCoverage * clamp(unionCoverage)
+    + WEIGHT.coverageGain * clamp(coverageGain)
+    + WEIGHT.edge * clamp(input.edgeWeight)
+    + WEIGHT.provenance * provenanceFactor
+    + WEIGHT.intent * edgeIntentCompatibility(input.intent, input.edgeType),
+  );
+  const meetsLinkedEvidenceGate = (linkedCoverage >= MIN_LINKED_COVERAGE || linked.exactHighIdf)
+    && hasPreciseLinkedEvidence;
+  if (!meetsLinkedEvidenceGate || score < MIN_NEIGHBORHOOD_SCORE) {
+    return { eligible: false, score: 0, coverage: linkedCoverage, coverageGain, rejection: "weak-neighborhood" };
+  }
+  if (unionCoverage < clamp(input.replacementCoverage) + MIN_EVIDENCE_GAIN) {
+    return { eligible: false, score: 0, coverage: linkedCoverage, coverageGain, rejection: "no-evidence-gain" };
+  }
 
   return {
     eligible: true,
-    score: input.parentScore
-      * Math.pow(input.hopDecay, input.hop)
-      * input.edgeWeight
-      * provenanceFactor
-      * evidenceFactor,
+    score,
+    coverage: linkedCoverage,
+    coverageGain,
   };
 }
