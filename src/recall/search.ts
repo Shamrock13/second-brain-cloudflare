@@ -288,22 +288,25 @@ export async function recallEntries(
       hop: 0,
       staleAsOf: hasStaleAsOf(JSON.parse(row.tags ?? "[]")),
     }];
-  });
+  }).sort((a, b) => b.score - a.score);
 
   const graphSeedScores = new Map(graphCandidates.map(m => [
     ((m.metadata as any)?.parentId ?? m.id) as string,
     m.score,
   ]));
   const rootScoreByNode = new Map(graphSeedScores);
+  const fallbackRootScore = directCandidates.at(-1)?.score ?? 0;
+  for (const e of expanded) {
+    rootScoreByNode.set(
+      e.id,
+      rootScoreByNode.get(e.viaFrom) ?? graphSeedScores.get(e.viaFrom) ?? fallbackRootScore,
+    );
+  }
   const expandedMatches: { match: RecallMatch; eligible: boolean }[] = expanded.flatMap((e) => {
     const row = d1Map.get(e.id);
     if (!row) return [];
     const parentRow = d1Map.get(e.viaFrom);
-    const rootScore = rootScoreByNode.get(e.viaFrom)
-      ?? graphSeedScores.get(e.viaFrom)
-      ?? directCandidates.at(-1)?.score
-      ?? 0;
-    rootScoreByNode.set(e.id, rootScore);
+    const rootScore = rootScoreByNode.get(e.id) ?? fallbackRootScore;
     const evidence = scoreLinkedEvidence({
       parentScore: rootScore,
       parentContent: (parentRow?.content as string | undefined) ?? "",
@@ -342,18 +345,11 @@ export async function recallEntries(
 
   const sortedExpanded = expandedMatches
     .sort((a, b) => b.match.score - a.match.score || a.match.id.localeCompare(b.match.id));
-  let selectedDirect: RecallMatch[];
-  let selectedRelated: RecallMatch[];
-  if (directMatches.length < topK) {
-    selectedDirect = directMatches;
-    selectedRelated = sortedExpanded.slice(0, topK - directMatches.length).map(e => e.match);
-  } else {
-    selectedRelated = sortedExpanded
-      .filter(e => e.eligible)
-      .slice(0, relatedSlotLimit(topK))
-      .map(e => e.match);
-    selectedDirect = directMatches.slice(0, topK - selectedRelated.length);
-  }
+  const selectedRelated = sortedExpanded
+    .filter(e => e.eligible)
+    .slice(0, relatedSlotLimit(topK))
+    .map(e => e.match);
+  const selectedDirect = directMatches.slice(0, topK - selectedRelated.length);
   const matches: RecallMatch[] = [...selectedDirect, ...selectedRelated];
 
   const presentedDirectIds = new Set(selectedDirect.map(m => m.id));

@@ -270,6 +270,7 @@ describe("recall stays inside D1's statement limits", () => {
       const hydration = hydrationStatements(executed);
       expect(hydration.map(h => h.params.length)).toEqual([100, 4]);
       expect(Math.max(...hydration.map(h => h.params.length))).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
+      expect(executed.length).toBeLessThanOrEqual(30);
     });
   });
 });

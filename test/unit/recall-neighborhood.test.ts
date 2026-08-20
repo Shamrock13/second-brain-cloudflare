@@ -33,16 +33,14 @@ describe("deterministic linked-evidence scoring", () => {
     hopDecay: 0.6,
   };
 
-  it("accepts an explicit continuation when the root carries the query context", () => {
+  it("rejects an explicit continuation when only the root carries query context", () => {
     const result = scoreLinkedEvidence({
       ...base,
       parentContent: "We changed the anniversary plan because the trip was impractical",
-      content: "Chateau Elan solved the childcare constraint",
+      content: "Chateau Elan solved the sitter constraint",
     });
 
-    expect(result.eligible).toBe(true);
-    expect(result.score).toBeGreaterThan(0);
-    expect(result.score).toBeLessThan(base.parentScore);
+    expect(result).toEqual({ eligible: false, score: 0 });
   });
 
   it("rejects an inferred neighbor that contributes no query evidence", () => {

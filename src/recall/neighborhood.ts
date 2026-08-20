@@ -69,8 +69,7 @@ export function scoreLinkedEvidence(input: LinkedEvidenceInput): LinkedEvidenceS
     input.queryTokens,
     input.corpus,
   );
-  const explicitContinuation = input.provenance === "explicit" && parentCoverage > 0;
-  const eligible = linkedCoverage > 0 || explicitContinuation;
+  const eligible = linkedCoverage > 0;
   if (!eligible) return { eligible: false, score: 0 };
 
   const provenanceFactor = input.provenance === "explicit"

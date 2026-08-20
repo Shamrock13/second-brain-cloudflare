@@ -3,17 +3,27 @@ import { recallEntries } from "../../src/recall/search";
 import { makeTestDb, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 
 const cases = [
-  { domain: "personal", query: "anniversary childcare", answer: "Chateau Elan solved the sitter constraint" },
-  { domain: "enterprise", query: "backend dotnet", answer: "The Microsoft stack aligned with enterprise support skills" },
-  { domain: "governance", query: "review cycles", answer: "Separate passes kept critique independent from approval" },
-  { domain: "operations", query: "issue ledger", answer: "Closed items were still counted as open" },
-  { domain: "product", query: "learn council", answer: "Navigation followed user intent while risk governed oversight" },
-  { domain: "launch", query: "product hunt", answer: "Fabian Merian requested the earlier Sunday" },
-  { domain: "architecture", query: "okf retrieval", answer: "It is a portable document format rather than a query engine" },
-  { domain: "insights", query: "derivepattern rebuilt", answer: "Zero of 135 proposals were accepted" },
-  { domain: "platform", query: "graph fanout", answer: "The ceiling bounds database reads and response growth" },
-  { domain: "operating-model", query: "advisor partner", answer: "Search changed from a gate into guided recommendations" },
+  { domain: "personal", query: "anniversary childcare", answer: "The anniversary moved to Chateau Elan to solve the sitter constraint" },
+  { domain: "enterprise", query: "backend dotnet", answer: "The backend moved to the Microsoft stack for enterprise support skills" },
+  { domain: "governance", query: "review cycles", answer: "The review separated critique from approval" },
+  { domain: "operations", query: "issue ledger", answer: "The ledger still counted closed items as open" },
+  { domain: "product", query: "learn council", answer: "Learn followed user intent while risk governed oversight" },
+  { domain: "launch", query: "product hunt", answer: "The Product launch moved because Fabian Merian requested the earlier Sunday" },
+  { domain: "architecture", query: "okf retrieval", answer: "OKF is a portable document format rather than a query engine" },
+  { domain: "insights", query: "derivepattern rebuilt", answer: "DerivePattern was removed because zero of 135 proposals were accepted" },
+  { domain: "platform", query: "graph fanout", answer: "The graph ceiling bounds database reads and response growth" },
+  { domain: "operating-model", query: "advisor partner", answer: "Advisor search changed from a gate into guided recommendations" },
 ] as const;
+
+function suppressKeywordSearch(db: ReturnType<typeof makeTestDb>) {
+  const prepare = db.prepare.bind(db);
+  (db as any).prepare = (sql: string) => {
+    if (sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")) {
+      return { bind: () => ({ all: async () => ({ results: [] }) }) };
+    }
+    return prepare(sql);
+  };
+}
 
 function fixture(c: typeof cases[number]) {
   const db = makeTestDb();
@@ -62,6 +72,7 @@ function fixture(c: typeof cases[number]) {
     created_at: 1,
     updated_at: 1,
   });
+  suppressKeywordSearch(db);
 
   const matches = [
     ...[0, 1, 2, 3, 4].map(i => ({
