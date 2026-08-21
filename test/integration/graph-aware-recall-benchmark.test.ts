@@ -122,6 +122,7 @@ describe("graph-aware recall multi-domain benchmark", () => {
       parentContent: "Specific ledger decision root",
       content: "A generic platform overview",
       queryTokens: ["platform", "ledger"],
+      evidenceTokens: ["platform", "ledger", "status", "planning"],
       corpus: { total: 100, df: new Map([["platform", 90], ["ledger", 2]]) },
       hop: 1,
       edgeWeight: 1,

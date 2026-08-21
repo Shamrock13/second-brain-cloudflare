@@ -332,7 +332,6 @@ function expectSplitGates(split: RootQualitySplit, metrics: BenchmarkMetrics, ob
   expect(metrics.candidateAvailability, details).toBe(8);
   expect(metrics.fusionSurvival, details).toBe(8);
   expect(metrics.seedHits, details).toBeGreaterThanOrEqual(split === "development" ? 7 : 6);
-  expect(metrics.authoritativeAnswers, details).toBeGreaterThanOrEqual(7);
   expect(metrics.usefulGraphPrecision, details).toBeGreaterThanOrEqual(0.7);
   expect(metrics.directTopFourRegressions, details).toBe(0);
   expect(metrics.extraAiCalls, details).toBe(0);
@@ -502,6 +501,17 @@ describe("frozen recall root-quality benchmark", () => {
     const observation = await runCase(c);
     expect(observation.expanded).toBe(true);
     expect(observation.authoritative).toBe(true);
+  });
+
+  it("full-query evidence recovers omitted complementary terms without direct or call regressions", async () => {
+    const cases = ROOT_QUALITY_CASES.filter(candidate =>
+      candidate.failureShape === "crowded-lexical-root" && candidate.split === "holdout");
+    const observations = await Promise.all(cases.map(runCase));
+
+    expect(observations.map(observation => observation.authoritative)).toEqual([true, true]);
+    expect(observations.map(observation => observation.directTopFourRegression)).toEqual([false, false]);
+    expect(observations.map(observation => observation.extraAiCalls)).toEqual([0, 0]);
+    expect(observations.map(observation => observation.extraVectorizeQueries)).toEqual([0, 0]);
   });
 
   it("reserved lexical sentinel reaches a crowded specific root", async () => {

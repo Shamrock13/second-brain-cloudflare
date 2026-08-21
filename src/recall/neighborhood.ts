@@ -22,6 +22,7 @@ export interface LinkedEvidenceInput {
   parentContent: string;
   content: string;
   queryTokens: string[];
+  evidenceTokens: string[];
   corpus: Pick<DistilledQuery, "df" | "total">;
   hop: number;
   edgeWeight: number;
@@ -99,14 +100,24 @@ function exactBoundaryMatchCount(content: string, tokens: string[]): number {
 }
 
 export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvidenceScore {
-  const parentCoverage = queryCoverage(input.parentContent, input.queryTokens, input.corpus).score;
-  const linked = queryCoverage(input.content, input.queryTokens, input.corpus);
-  const unionCoverage = queryCoverage(
-    `${input.parentContent}\n${input.content}`,
-    input.queryTokens,
-    input.corpus,
-  ).score;
-  const linkedCoverage = linked.score;
+  const parentCoverage = Math.max(
+    queryCoverage(input.parentContent, input.queryTokens, input.corpus).score,
+    queryCoverage(input.parentContent, input.evidenceTokens, input.corpus).score,
+  );
+  const precision = queryCoverage(input.content, input.queryTokens, input.corpus);
+  const linkedCoverage = Math.max(
+    precision.score,
+    queryCoverage(input.content, input.evidenceTokens, input.corpus).score,
+  );
+  const unionContent = `${input.parentContent}\n${input.content}`;
+  const unionCoverage = Math.max(
+    queryCoverage(unionContent, input.queryTokens, input.corpus).score,
+    queryCoverage(
+      unionContent,
+      input.evidenceTokens,
+      input.corpus,
+    ).score,
+  );
   const coverageGain = Math.max(0, unionCoverage - parentCoverage);
   if (linkedCoverage === 0) {
     return { eligible: false, score: 0, coverage: linkedCoverage, coverageGain, rejection: "no-linked-evidence" };
@@ -128,8 +139,8 @@ export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvi
     + WEIGHT.provenance * provenanceFactor
     + WEIGHT.intent * edgeIntentCompatibility(input.intent, input.edgeType),
   );
-  const meetsPrecisionGate = linked.exactHighIdf || exactBoundaryMatchCount(input.content, input.queryTokens) >= 2;
-  const meetsLinkedEvidenceGate = (linkedCoverage >= MIN_LINKED_COVERAGE || linked.exactHighIdf)
+  const meetsPrecisionGate = precision.exactHighIdf || exactBoundaryMatchCount(input.content, input.queryTokens) >= 2;
+  const meetsLinkedEvidenceGate = (linkedCoverage >= MIN_LINKED_COVERAGE || precision.exactHighIdf)
     && meetsPrecisionGate;
   if (!meetsLinkedEvidenceGate || score < MIN_NEIGHBORHOOD_SCORE) {
     return { eligible: false, score: 0, coverage: linkedCoverage, coverageGain, rejection: "weak-neighborhood" };

@@ -27,6 +27,7 @@ describe("deterministic linked-evidence scoring", () => {
   const base = {
     parentScore: 0.8,
     queryTokens: ["anniversary", "childcare"],
+    evidenceTokens: ["anniversary", "childcare"],
     corpus: { df: null, total: null },
     hop: 1,
     edgeWeight: 1,
@@ -76,6 +77,7 @@ describe("deterministic linked-evidence scoring", () => {
       parentContent: "The platform backend changed",
       content: "The platform supports teams",
       queryTokens: ["platform", "dotnet"],
+      evidenceTokens: ["platform", "dotnet"],
       corpus,
     });
     const rare = scoreLinkedEvidence({
@@ -83,6 +85,7 @@ describe("deterministic linked-evidence scoring", () => {
       parentContent: "The platform backend changed",
       content: "Dotnet aligned with enterprise support",
       queryTokens: ["platform", "dotnet"],
+      evidenceTokens: ["platform", "dotnet"],
       corpus,
     });
 
@@ -113,6 +116,7 @@ describe("deterministic linked-evidence scoring", () => {
       parentContent: "Enterprise platform review",
       content: "The platform home page was redesigned",
       queryTokens: ["platform", "ledger"],
+      evidenceTokens: ["platform", "ledger"],
       corpus: { df: new Map([["platform", 90], ["ledger", 2]]), total: 100 },
       replacementCoverage: 0.2,
       intent: "causal",
@@ -129,6 +133,7 @@ describe("deterministic linked-evidence scoring", () => {
       parentContent: "Ledger status changed",
       content: "The ledgering job completed",
       queryTokens: ["ledger", "status"],
+      evidenceTokens: ["ledger", "status"],
       corpus: { df: new Map([["ledger", 90], ["status", 80]]), total: 100 },
       replacementCoverage: 0,
     });
@@ -144,6 +149,7 @@ describe("deterministic linked-evidence scoring", () => {
       parentContent: "",
       content: "platforms",
       queryTokens: ["platform"],
+      evidenceTokens: ["platform"],
       corpus: { df: new Map([["platform", 90]]), total: 100 },
       hop: 0,
       hopDecay: 1,
@@ -161,6 +167,7 @@ describe("deterministic linked-evidence scoring", () => {
     parentContent: "The backend direction changed",
     content: "Dotnet matched enterprise support skills",
     queryTokens: ["backend", "dotnet"],
+    evidenceTokens: ["backend", "dotnet"],
     corpus: { df: new Map([["backend", 30], ["dotnet", 2]]), total: 100 },
     intent: "causal" as const,
     edgeType: "decided" as const,
@@ -171,6 +178,51 @@ describe("deterministic linked-evidence scoring", () => {
 
     expect(score.eligible).toBe(true);
     expect(score.coverageGain).toBeGreaterThan(0.1);
+  });
+
+  it("uses full-query tokens for complementary evidence without weakening the precision gate", () => {
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentScore: 0.4,
+      parentContent: "Cobalt ownership moved",
+      content: "Cobalt runtime switched teams",
+      queryTokens: ["cobalt", "runtime", "vendor"],
+      evidenceTokens: ["reason", "cobalt", "runtime", "ownership", "switched"],
+      corpus: {
+        df: new Map([
+          ["reason", 90],
+          ["cobalt", 90],
+          ["runtime", 90],
+          ["ownership", 90],
+          ["switched", 90],
+        ]),
+        total: 100,
+      },
+      replacementCoverage: 0.6,
+      intent: "causal",
+      edgeType: "caused_by",
+    });
+
+    expect(score.eligible).toBe(true);
+    expect(score.coverageGain).toBeCloseTo(0.4, 10);
+  });
+
+  it("still rejects weak generic evidence when the full-query channel is broader", () => {
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentScore: 0.2,
+      parentContent: "Planning status marker",
+      content: "Planning status overview",
+      queryTokens: ["planning", "status", "allocation"],
+      evidenceTokens: ["neighborhood", "allocation", "status", "planning", "review", "update", "summary", "notes"],
+      corpus: { df: null, total: null },
+      edgeWeight: 0.18,
+      provenance: "system",
+      replacementCoverage: 0,
+    });
+
+    expect(score.eligible).toBe(false);
+    expect(score.rejection).toBe("weak-neighborhood");
   });
 
   it("abstains when the neighborhood does not improve on the replaced direct evidence", () => {

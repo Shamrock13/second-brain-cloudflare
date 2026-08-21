@@ -22,11 +22,19 @@ describe("recall query profile", () => {
     );
     expect(profile.semanticQuery).toBe("why did we change the enterprise backend direction");
     expect(profile.lexicalQuery).toBe("enterprise backend");
+    expect(profile.evidenceTokens).toEqual(["change", "enterprise", "backend", "direction"]);
     expect(embeddingInput(profile, "distilled")).toBe("enterprise backend");
     expect(embeddingInput(profile, "semantic")).toBe(profile.semanticQuery);
     expect(embeddingInput(profile, "hybrid")).toBe(
       "why did we change the enterprise backend direction enterprise backend",
     );
+  });
+
+  it("bounds full cleaned-query evidence tokens deterministically", () => {
+    const query = Array.from({ length: 20 }, (_, index) => `signal${index}`).join(" ");
+
+    expect(buildQueryProfile(query, { query: "signal19 signal18 signal17", df: null, total: null }).evidenceTokens)
+      .toEqual(Array.from({ length: 16 }, (_, index) => `signal${index}`));
   });
 
   it("uses edge types as soft intent compatibility", () => {

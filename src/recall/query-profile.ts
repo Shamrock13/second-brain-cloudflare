@@ -1,4 +1,5 @@
 import type { EdgeType } from "../graph/types";
+import { KEYWORD_MAX_TOKENS } from "../constants";
 import { tokenizeQuery } from "../text/tokenize";
 import type { DistilledQuery } from "./distill";
 
@@ -10,6 +11,7 @@ export interface QueryProfile {
   semanticQuery: string;
   lexicalQuery: string;
   lexicalTokens: string[];
+  evidenceTokens: string[];
   intent: RecallIntent;
 }
 
@@ -31,6 +33,7 @@ export function buildQueryProfile(semanticQuery: string, distilled: DistilledQue
     semanticQuery: clean,
     lexicalQuery: distilled.query,
     lexicalTokens: tokenizeQuery(distilled.query),
+    evidenceTokens: tokenizeQuery(clean).slice(0, KEYWORD_MAX_TOKENS),
     intent,
   };
 }

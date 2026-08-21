@@ -332,7 +332,10 @@ export async function recallEntries(
   }
   const relatedLimit = relatedSlotLimit(topK);
   const replacement = directMatches[topK - relatedLimit];
-  const replacementCoverage = replacement ? queryCoverage(replacement.content, tokens, distilled).score : 0;
+  const replacementCoverage = replacement ? Math.max(
+    queryCoverage(replacement.content, tokens, distilled).score,
+    queryCoverage(replacement.content, profile.evidenceTokens, distilled).score,
+  ) : 0;
   const expandedMatches: { match: RecallMatch; eligible: boolean }[] = expanded.flatMap((e) => {
     const row = d1Map.get(e.id);
     if (!row) return [];
@@ -343,6 +346,7 @@ export async function recallEntries(
       parentContent: root?.localEvidence ?? "",
       content: row.content as string,
       queryTokens: tokens,
+      evidenceTokens: profile.evidenceTokens,
       corpus: distilled,
       hop: e.hop,
       edgeWeight: e.viaWeight,
