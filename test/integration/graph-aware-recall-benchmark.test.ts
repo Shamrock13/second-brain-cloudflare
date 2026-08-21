@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { scoreLinkedEvidence } from "../../src/recall/neighborhood";
 import { recallEntries } from "../../src/recall/search";
 import { makeTestDb, makeTestEnv, makeVectorizeMock } from "../helpers/make-env";
 
@@ -114,4 +115,24 @@ describe("graph-aware recall multi-domain benchmark", () => {
       expect(withGraph.matches).toHaveLength(5);
     });
   }
+
+  it("intentionally abstains from a neighbor matching one common low-IDF term", () => {
+    const evidence = scoreLinkedEvidence({
+      parentScore: 1,
+      parentContent: "Specific ledger decision root",
+      content: "A generic platform overview",
+      queryTokens: ["platform", "ledger"],
+      corpus: { total: 100, df: new Map([["platform", 90], ["ledger", 2]]) },
+      hop: 1,
+      edgeWeight: 1,
+      provenance: "explicit",
+      hopDecay: 0.6,
+      replacementCoverage: 0,
+      intent: "direct",
+      edgeType: "relates_to",
+    });
+
+    expect(evidence.eligible).toBe(false);
+    expect(evidence.rejection).toBe("weak-neighborhood");
+  });
 });
