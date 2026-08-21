@@ -3,7 +3,7 @@
 **Release:** v2.4  
 **Feature branch:** `feat/v2.4-graph-aware-recall`  
 **Date:** 2026-08-21  
-**Status:** Approved in chat; written review pending
+**Status:** Approved by Rahil in chat
 
 ## Goal
 
