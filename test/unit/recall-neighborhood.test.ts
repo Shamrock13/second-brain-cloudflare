@@ -225,6 +225,26 @@ describe("deterministic linked-evidence scoring", () => {
     expect(score.rejection).toBe("weak-neighborhood");
   });
 
+  it("does not combine query terms scattered across an unbounded linked memory", () => {
+    const noise = "x".repeat(600);
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentScore: 1,
+      parentContent: "root context",
+      content: `alpha ${noise} beta ${noise} gamma`,
+      queryTokens: ["alpha", "beta", "gamma"],
+      evidenceTokens: ["alpha", "beta", "gamma"],
+      corpus: { df: null, total: null },
+      edgeWeight: 1,
+      replacementCoverage: 0,
+      intent: "causal",
+      edgeType: "decided",
+    });
+
+    expect(score.eligible).toBe(false);
+    expect(score.rejection).toBe("no-linked-evidence");
+  });
+
   it("abstains when the neighborhood does not improve on the replaced direct evidence", () => {
     const score = scoreLinkedEvidence({ ...qualifying, replacementCoverage: 1 });
 

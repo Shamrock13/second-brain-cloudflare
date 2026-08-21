@@ -2,6 +2,7 @@ import { VECTORIZE_TOP_K_MULTIPLIER } from "../constants";
 import type { EdgeProvenance, EdgeType } from "../graph/types";
 import type { DistilledQuery } from "./distill";
 import { edgeIntentCompatibility, type RecallIntent } from "./query-profile";
+import { queryRelevantWindow } from "./snippet";
 
 const SUBSTRING_WEIGHT = 0.25;
 const WEIGHT = {
@@ -100,16 +101,20 @@ function exactBoundaryMatchCount(content: string, tokens: string[]): number {
 }
 
 export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvidenceScore {
+  const linkedEvidence = queryRelevantWindow(
+    input.content,
+    [...input.queryTokens, ...input.evidenceTokens],
+  );
   const parentCoverage = Math.max(
     queryCoverage(input.parentContent, input.queryTokens, input.corpus).score,
     queryCoverage(input.parentContent, input.evidenceTokens, input.corpus).score,
   );
-  const precision = queryCoverage(input.content, input.queryTokens, input.corpus);
+  const precision = queryCoverage(linkedEvidence, input.queryTokens, input.corpus);
   const linkedCoverage = Math.max(
     precision.score,
-    queryCoverage(input.content, input.evidenceTokens, input.corpus).score,
+    queryCoverage(linkedEvidence, input.evidenceTokens, input.corpus).score,
   );
-  const unionContent = `${input.parentContent}\n${input.content}`;
+  const unionContent = `${input.parentContent}\n${linkedEvidence}`;
   const unionCoverage = Math.max(
     queryCoverage(unionContent, input.queryTokens, input.corpus).score,
     queryCoverage(
@@ -139,7 +144,7 @@ export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvi
     + WEIGHT.provenance * provenanceFactor
     + WEIGHT.intent * edgeIntentCompatibility(input.intent, input.edgeType),
   );
-  const meetsPrecisionGate = precision.exactHighIdf || exactBoundaryMatchCount(input.content, input.queryTokens) >= 2;
+  const meetsPrecisionGate = precision.exactHighIdf || exactBoundaryMatchCount(linkedEvidence, input.queryTokens) >= 2;
   const meetsLinkedEvidenceGate = (linkedCoverage >= MIN_LINKED_COVERAGE || precision.exactHighIdf)
     && meetsPrecisionGate;
   if (!meetsLinkedEvidenceGate || score < MIN_NEIGHBORHOOD_SCORE) {

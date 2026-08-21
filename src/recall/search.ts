@@ -213,13 +213,17 @@ export async function recallEntries(
 
   const candidateIds = [...new Set(fusedMatches.map(m => (m.metadata as any)?.parentId ?? m.id))] as string[];
   internal.diagnostics && (internal.diagnostics.fusedIds = candidateIds);
-  const rcRows: { id: string; content: string; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number; tags: string }[] = [];
+  type CandidateSignalRow = { id: string; content?: string; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number; tags: string };
+  const rcRows: CandidateSignalRow[] = [];
+  const candidateSignalProjection = hops > 0
+    ? "id, content, recall_count, importance_score, contradiction_wins, contradiction_losses, tags"
+    : "id, recall_count, importance_score, contradiction_wins, contradiction_losses, tags";
   for (let i = 0; i < candidateIds.length; i += D1_MAX_BOUND_PARAMS) {
     const batch = candidateIds.slice(i, i + D1_MAX_BOUND_PARAMS);
     const rcPlaceholders = batch.map(() => "?").join(", ");
     const { results: rows } = await env.DB.prepare(
-      `SELECT id, content, recall_count, importance_score, contradiction_wins, contradiction_losses, tags FROM entries WHERE id IN (${rcPlaceholders})`
-    ).bind(...batch).all() as { results: { id: string; content: string; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number; tags: string }[] };
+      `SELECT ${candidateSignalProjection} FROM entries WHERE id IN (${rcPlaceholders})`
+    ).bind(...batch).all() as { results: CandidateSignalRow[] };
     rcRows.push(...rows);
   }
   const recallCounts = new Map(rcRows.map(r => [r.id, r.recall_count ?? 0]));
@@ -285,7 +289,11 @@ export async function recallEntries(
     ...expanded.map(e => e.id),
   ])];
   let d1Filters = ` AND tags NOT LIKE '%"auto-pattern"%' AND tags NOT LIKE '%"auto-insight"%' AND tags NOT LIKE '%"status:deprecated"%'`;
-  const filterBindings: number[] = [];
+  const filterBindings: (string | number)[] = [];
+  if (tag) {
+    d1Filters += ` AND tags LIKE ? ${TAG_LIKE_ESCAPE}`;
+    filterBindings.push(tagLikePattern(tag));
+  }
   if (kind && (KIND_VALUES as readonly string[]).includes(kind)) {
     d1Filters += ` AND tags LIKE '%"kind:${kind}"%'`;
   }

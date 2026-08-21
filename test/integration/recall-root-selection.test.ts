@@ -128,6 +128,59 @@ describe("recall root selection", () => {
     expect(result.matches.map(match => match.id)).not.toContain("unrelated-neighbor");
   });
 
+  it("abstains when linked query terms are scattered across a long memory", async () => {
+    const db = new D1Mock();
+    seed(db, "long-root", "root context");
+    const noise = "x".repeat(600);
+    seed(db, "long-neighbor", `alpha ${noise} beta ${noise} gamma`);
+    edge(db, "long-root", "long-neighbor");
+    const prepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+      ? { bind: () => ({ all: async () => ({ results: [] }) }) }
+      : prepare(sql);
+    const diagnostics: RecallDiagnostics = {};
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
+      { id: "long-root", score: .9, metadata: { parentId: "long-root" } },
+    ] }) }) });
+
+    const result = await recallEntries(
+      { query: "alpha beta gamma", topK: 5, hops: 1, synthesize: false },
+      env,
+      ctx,
+      undefined,
+      { diagnostics },
+    );
+
+    expect(result.matches.map(match => match.id)).toEqual(["long-root"]);
+    expect(diagnostics.rejections).toContainEqual({ id: "long-neighbor", reason: "no-linked-evidence" });
+  });
+
+  it("selects candidate content only for graph-aware recalls", async () => {
+    const candidateSql = async (hops: 0 | 1) => {
+      const db = new D1Mock();
+      seed(db, "root", "alpha beta root");
+      const prepared: string[] = [];
+      const prepare = db.prepare.bind(db);
+      (db as any).prepare = (sql: string) => {
+        if (sql.includes("recall_count") && sql.includes("WHERE id IN")) prepared.push(sql.replace(/\s+/g, " ").trim());
+        return prepare(sql);
+      };
+      const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
+        { id: "root", score: .9, metadata: { parentId: "root" } },
+      ] }) }) });
+
+      await recallEntries({ query: "alpha beta", topK: 5, hops, synthesize: false }, env, ctx);
+      return prepared;
+    };
+
+    const hops0 = await candidateSql(0);
+    const hops1 = await candidateSql(1);
+    expect(hops0).toHaveLength(1);
+    expect(hops1).toHaveLength(1);
+    expect(hops0[0]).not.toMatch(/^SELECT id, content,/);
+    expect(hops1[0]).toMatch(/^SELECT id, content,/);
+  });
+
   it("uses the configured default embedding mode when the internal override is absent", async () => {
     const db = new D1Mock();
     seed(db, "root", "ledger");

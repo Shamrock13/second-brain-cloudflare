@@ -236,12 +236,12 @@ describe("recall stays inside D1's statement limits", () => {
       expect(Math.max(...hydration.map(h => h.params.length))).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
     });
 
-    it("chunks the maximum graph-root plus expanded-node union with time filters", async () => {
+    it("chunks the maximum graph-root plus expanded-node union with tag and time filters", async () => {
       const roots = Array.from({ length: 50 }, (_, i) => `root-${i}`);
       const neighbors = Array.from({ length: 50 }, (_, i) => `neighbor-${i}`);
       for (const [i, id] of roots.entries()) {
-        sqlite.seed({ id, content: `topic0 decision root ${i}`, createdAt: 1000 + i });
-        sqlite.seed({ id: neighbors[i], content: `linked evidence ${i}`, createdAt: 1000 + i });
+        sqlite.seed({ id, content: `topic0 decision root ${i}`, createdAt: 1000 + i, tags: ["work"], vectorIds: [`v-${id}`] });
+        sqlite.seed({ id: neighbors[i], content: `linked evidence ${i}`, createdAt: 1000 + i, tags: ["work"] });
         await sqlite.db.prepare(
           `INSERT INTO edges (id, source_id, target_id, type, weight, provenance, metadata, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -249,18 +249,16 @@ describe("recall stays inside D1's statement limits", () => {
       }
       const env = envWith(undefined, {
         VECTORIZE: makeVectorizeMock({
-          query: vi.fn().mockResolvedValue({
-            matches: roots.map((id, i) => ({
-              id,
-              score: 1 - i / 100,
-              metadata: { parentId: id, created_at: 1000 + i },
-            })),
-          }),
+          getByIds: vi.fn(async (ids: string[]) => ids.map(id => ({
+            id,
+            values: new Array(384).fill(0.1),
+            metadata: { parentId: id.replace(/^v-/, "") },
+          }))),
         }),
       });
 
       const { matches } = await recallEntries(
-        { query: "topic0", topK: 20, hops: 1, after: 900, before: 2000, synthesize: false },
+        { query: "topic0", topK: 20, tag: "work", hops: 1, after: 900, before: 2000, synthesize: false },
         env,
         ctx,
       );
@@ -268,7 +266,8 @@ describe("recall stays inside D1's statement limits", () => {
       expect(matches).toHaveLength(20);
       expect(new Set(matches.map(m => m.id)).size).toBe(20);
       const hydration = hydrationStatements(executed);
-      expect(hydration.map(h => h.params.length)).toEqual([100, 4]);
+      expect(hydration.map(h => h.params.length)).toEqual([100, 6]);
+      expect(hydration.every(h => h.params.includes('%"work"%'))).toBe(true);
       expect(Math.max(...hydration.map(h => h.params.length))).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMS);
       expect(executed.length).toBeLessThanOrEqual(30);
     });
