@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULTS } from "../../src/config";
+import { DEFAULT_EMBEDDING_QUERY_MODE } from "../../src/recall/query-profile";
 import { recallEntries } from "../../src/recall/search";
 import type { RecallDiagnostics } from "../../src/recall/types";
 import { D1Mock } from "../helpers/d1-mock";
@@ -127,13 +128,39 @@ describe("recall root selection", () => {
     expect(result.matches.map(match => match.id)).not.toContain("unrelated-neighbor");
   });
 
-  it.each(["distilled", "semantic", "hybrid"] as const)("uses one embedding call in %s mode", async (embeddingQueryMode) => {
+  it("uses the configured default embedding mode when the internal override is absent", async () => {
     const db = new D1Mock();
-    seed(db, "root", "ledger status change", ["work"]);
+    seed(db, "root", "ledger");
+    const query = vi.fn().mockResolvedValue({ matches: [{ id: "root", score: .9, metadata: { parentId: "root" } }] });
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query }) });
+    const diagnostics: RecallDiagnostics = {};
+    const expectedInput = {
+      distilled: "ledger",
+      semantic: "why ledger",
+      hybrid: "why ledger ledger",
+    } as const;
+
+    await recallEntries({ query: "why ledger", topK: 5, synthesize: false }, env, ctx, undefined, { diagnostics });
+
+    expect(env.AI.run).toHaveBeenCalledTimes(1);
+    expect(env.AI.run).toHaveBeenCalledWith(DEFAULTS.EMBEDDING_MODEL, {
+      text: [expectedInput[DEFAULT_EMBEDDING_QUERY_MODE]],
+    });
+    expect(diagnostics.embeddingMode).toBe(DEFAULT_EMBEDDING_QUERY_MODE);
+  });
+
+  it.each([
+    ["distilled", "ledger"],
+    ["semantic", "why ledger"],
+    ["hybrid", "why ledger ledger"],
+  ] as const)("uses one embedding call in %s mode", async (embeddingQueryMode, expectedInput) => {
+    const db = new D1Mock();
+    seed(db, "root", "ledger");
     const query = vi.fn().mockResolvedValue({ matches: [{ id: "root", score: .9, metadata: { parentId: "root" } }] });
     const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query }) });
 
-    await recallEntries({ query: "ledger status work", topK: 5, synthesize: false }, env, ctx, undefined, { embeddingQueryMode });
+    await recallEntries({ query: "why ledger", topK: 5, synthesize: false }, env, ctx, undefined, { embeddingQueryMode });
+    expect(env.AI.run).toHaveBeenCalledWith(DEFAULTS.EMBEDDING_MODEL, { text: [expectedInput] });
     expect(query).toHaveBeenCalledTimes(1);
     expect((env.AI.run as ReturnType<typeof vi.fn>).mock.calls.map(call => call[0])).toEqual([DEFAULTS.EMBEDDING_MODEL]);
   });

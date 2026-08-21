@@ -20,7 +20,7 @@ import { rrfFuse } from "./rrf";
 import { computeCompoundStale } from "./compound-stale";
 import { graphSeedLimit, relatedSlotLimit, scoreLinkedEvidence } from "./neighborhood";
 import { queryCoverage } from "./neighborhood";
-import { buildQueryProfile, embeddingInput } from "./query-profile";
+import { buildQueryProfile, DEFAULT_EMBEDDING_QUERY_MODE, embeddingInput } from "./query-profile";
 import { localEvidenceOf } from "./root-candidate";
 import { selectGraphRoots, type RootCandidate } from "./root-selector";
 import type { KeywordRow, RecallInternalOptions, RecallMatch, RecallSearchResult } from "./types";
@@ -134,9 +134,10 @@ export async function recallEntries(
   }
   const distilled = await distillToRareTerms(semanticQuery, env, cfg);
   const profile = buildQueryProfile(semanticQuery, distilled);
-  const embedQuery = embeddingInput(profile, internal.embeddingQueryMode ?? "distilled");
+  const embeddingQueryMode = internal.embeddingQueryMode ?? DEFAULT_EMBEDDING_QUERY_MODE;
+  const embedQuery = embeddingInput(profile, embeddingQueryMode);
   const lexicalQuery = profile.lexicalQuery;
-  internal.diagnostics && (internal.diagnostics.embeddingMode = internal.embeddingQueryMode ?? "distilled");
+  internal.diagnostics && (internal.diagnostics.embeddingMode = embeddingQueryMode);
 
   const tokens = profile.lexicalTokens;
   const [values, queryTags] = await Promise.all([
