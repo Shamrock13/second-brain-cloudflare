@@ -25,6 +25,7 @@ import { localEvidenceOf } from "./root-candidate";
 import { selectGraphRoots, type RootCandidate } from "./root-selector";
 import type { KeywordRow, RecallInternalOptions, RecallMatch, RecallSearchResult } from "./types";
 import { TAG_LIKE_ESCAPE, tagLikePattern } from "../memory/tag-sql";
+import { observeRecallEnv } from "./diagnostics";
 
 async function keywordSearch(tokens: string[], env: Env, limit: number): Promise<KeywordRow[]> {
   if (!tokens.length) return [];
@@ -117,6 +118,7 @@ export async function recallEntries(
   config?: Readonly<Config>,
   internal: RecallInternalOptions = {},
 ): Promise<RecallSearchResult> {
+  if (internal.diagnostics) env = observeRecallEnv(env, internal.diagnostics);
   const cfg = config ?? await resolveConfig(env);
   const { query, topK } = params;
   const synthesize = params.synthesize ?? true;
@@ -206,6 +208,11 @@ export async function recallEntries(
         console.error("Vectorize widen-query failed (non-fatal, keeping narrow results):", e);
       }
     }
+  }
+
+  if (internal.diagnostics) {
+    internal.diagnostics.denseIds = [...new Set(results.matches.map(m => ((m.metadata as any)?.parentId ?? m.id) as string))];
+    internal.diagnostics.keywordIds = [...new Set(keywordRows.map(row => row.id))];
   }
 
   const fusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag || semanticUnavailable, distilled, cfg.SUBSTRING_MATCH_WEIGHT);
@@ -389,6 +396,11 @@ export async function recallEntries(
 
   const sortedExpanded = expandedMatches
     .sort((a, b) => b.match.score - a.match.score || a.match.id.localeCompare(b.match.id));
+  if (internal.diagnostics) {
+    internal.diagnostics.eligibleRelatedIds = sortedExpanded
+      .filter(entry => entry.eligible && !directParentIds.includes(entry.match.id))
+      .map(entry => entry.match.id);
+  }
   const selectedRelated = sortedExpanded
     .filter(e => e.eligible && !directParentIds.includes(e.match.id))
     .slice(0, relatedLimit)
@@ -396,6 +408,7 @@ export async function recallEntries(
   if (internal.diagnostics) internal.diagnostics.selectedRelatedIds = selectedRelated.map(x => x.id);
   const selectedDirect = directMatches.slice(0, topK - selectedRelated.length);
   const matches: RecallMatch[] = [...selectedDirect, ...selectedRelated];
+  if (internal.diagnostics) internal.diagnostics.finalIds = matches.map(match => match.id);
 
   const presentedDirectIds = new Set(selectedDirect.map(m => m.id));
   ctx.waitUntil(

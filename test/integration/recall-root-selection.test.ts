@@ -13,6 +13,67 @@ const edge = (db: D1Mock, source_id: string, target_id: string) =>
   db.edges.push({ id: `${source_id}-${target_id}`, source_id, target_id, type: "decided", weight: 1, provenance: "explicit", metadata: "{}", created_at: 1, updated_at: 1 });
 
 describe("recall root selection", () => {
+  it("records the complete bounded candidate funnel without changing results", async () => {
+    const build = () => {
+      const db = new D1Mock();
+      seed(db, "dense-root", "atlas ledger root", ["work"]);
+      seed(db, "keyword-root", "atlas ledger reconciliation decision", ["work"]);
+      seed(db, "eligible", "atlas ledger changed because reconciliation was required", ["work"]);
+      seed(db, "weak", "grocery list", ["personal"]);
+      edge(db, "dense-root", "eligible");
+      edge(db, "dense-root", "weak");
+      const prepare = db.prepare.bind(db);
+      (db as any).prepare = (sql: string) => {
+        if (sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")) {
+          return { bind: () => ({ all: async () => ({ results: db.entries
+            .filter(entry => ["dense-root", "keyword-root"].includes(entry.id))
+            .map(({ id, content, tags, source, created_at }) => ({ id, content, tags, source, created_at })) }) }) };
+        }
+        return prepare(sql);
+      };
+      const vectorQuery = vi.fn().mockResolvedValue({
+        matches: [{ id: "dense-root", score: .9, metadata: { parentId: "dense-root" } }],
+      });
+      const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vectorQuery }) });
+      return { db, env, vectorQuery };
+    };
+
+    const ordinary = build();
+    const observed = build();
+    const ordinaryPrepare = vi.spyOn(ordinary.db, "prepare");
+    const observedPrepare = vi.spyOn(observed.db, "prepare");
+    const diagnostics: RecallDiagnostics = {};
+
+    const ordinaryResult = await recallEntries(
+      { query: "why atlas ledger changed", topK: 5, hops: 1, synthesize: false },
+      ordinary.env,
+      ctx,
+    );
+    const observedResult = await recallEntries(
+      { query: "why atlas ledger changed", topK: 5, hops: 1, synthesize: false },
+      observed.env,
+      ctx,
+      undefined,
+      { diagnostics },
+    );
+
+    expect(diagnostics.denseIds).toEqual(["dense-root"]);
+    expect(diagnostics.keywordIds).toEqual(expect.arrayContaining(["dense-root", "keyword-root"]));
+    expect(diagnostics.fusedIds).toEqual(expect.arrayContaining(["dense-root", "keyword-root"]));
+    expect(diagnostics.rootSelections?.map(x => x.id)).toContain("dense-root");
+    expect(diagnostics.expandedIds).toEqual(expect.arrayContaining(["eligible", "weak"]));
+    expect(diagnostics.eligibleRelatedIds).toContain("eligible");
+    expect(diagnostics.rejections).toContainEqual({ id: "weak", reason: "no-linked-evidence" });
+    expect(diagnostics.finalIds).toEqual(observedResult.matches.map(x => x.id));
+    expect(diagnostics.operations?.embeddingCalls).toBe(1);
+
+    expect(observedResult.matches.map(x => x.id)).toEqual(ordinaryResult.matches.map(x => x.id));
+    expect(observed.env.AI.run).toHaveBeenCalledTimes((ordinary.env.AI.run as ReturnType<typeof vi.fn>).mock.calls.length);
+    expect(observed.vectorQuery).toHaveBeenCalledTimes(ordinary.vectorQuery.mock.calls.length);
+    expect(observedPrepare).toHaveBeenCalledTimes(ordinaryPrepare.mock.calls.length);
+    expect(observed.env.OAUTH_KV.get).toHaveBeenCalledTimes((ordinary.env.OAUTH_KV.get as ReturnType<typeof vi.fn>).mock.calls.length);
+  });
+
   it("selects a rare lexical root crowded below semantic leaders", async () => {
     const db = new D1Mock();
     for (let i = 0; i < 16; i++) seed(db, `semantic-${i}`, `general summary ${i}`);

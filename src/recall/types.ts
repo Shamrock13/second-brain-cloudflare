@@ -38,12 +38,29 @@ export interface RecallSearchResult {
 
 export interface RecallDiagnostics {
   embeddingMode?: EmbeddingQueryMode;
+  denseIds?: string[];
+  keywordIds?: string[];
   candidateIds?: string[];
   fusedIds?: string[];
   rootSelections?: { id: string; selectedBy: RootView }[];
   expandedIds?: string[];
+  eligibleRelatedIds?: string[];
   selectedRelatedIds?: string[];
+  finalIds?: string[];
   rejections?: { id: string; reason: string }[];
+  operations?: RecallOperationDiagnostics;
+}
+
+export interface RecallOperationDiagnostics {
+  aiCalls: number;
+  embeddingCalls: number;
+  vectorizeQueries: number;
+  vectorizeGets: number;
+  d1Statements: number;
+  d1RowsRead: number | null;
+  d1RowsWritten: number | null;
+  kvReads: number;
+  kvWrites: number;
 }
 
 export interface RecallInternalOptions {
