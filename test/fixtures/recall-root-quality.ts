@@ -11,40 +11,38 @@ export type RootFailureShape =
   | "absent-cluster-control";
 
 export interface CandidateFixture {
-  id: string;
-  content: string;
+  readonly id: string;
+  readonly content: string;
   /** Query-local Vectorize chunk text. Absent on keyword-only and linked rows. */
-  vectorContent?: string;
+  readonly vectorContent?: string;
   /** Raw Vectorize similarity. Absent means this row is not in the dense pool. */
-  denseScore?: number;
-  /** Frozen post-fusion relevance used by the pre-plan baseline arm. */
-  baselineScore?: number;
+  readonly denseScore?: number;
   /** Include this row in the controlled keyword arm. */
-  keywordCandidate?: boolean;
-  recallCount?: number;
-  createdAt?: number;
-  tags?: string[];
+  readonly keywordCandidate?: boolean;
+  readonly recallCount?: number;
+  readonly createdAt?: number;
+  readonly tags?: readonly string[];
 }
 
 export interface EdgeFixture {
-  sourceId: string;
-  targetId: string;
-  type: EdgeType;
-  weight: number;
-  provenance: EdgeProvenance;
+  readonly sourceId: string;
+  readonly targetId: string;
+  readonly type: EdgeType;
+  readonly weight: number;
+  readonly provenance: EdgeProvenance;
 }
 
 export interface RootQualityCase {
-  split: RootQualitySplit;
-  domain: RootQualityDomain;
-  failureShape: RootFailureShape;
-  query: string;
-  intent: RecallIntent;
-  candidates: CandidateFixture[];
-  edges: EdgeFixture[];
-  authoritativeIds: string[];
-  acceptableRootIds: string[];
-  candidateAvailable: boolean;
+  readonly split: RootQualitySplit;
+  readonly domain: RootQualityDomain;
+  readonly failureShape: RootFailureShape;
+  readonly query: string;
+  readonly intent: RecallIntent;
+  readonly candidates: readonly CandidateFixture[];
+  readonly edges: readonly EdgeFixture[];
+  readonly authoritativeIds: readonly string[];
+  readonly acceptableRootIds: readonly string[];
+  readonly candidateAvailable: boolean;
 }
 
 const OLD = 1;
@@ -57,7 +55,6 @@ function directCandidates(prefix: string, authoritativeFifthId?: string): Candid
       : `General direct record ${index} for the controlled corpus.`,
     vectorContent: `General direct record ${index}.`,
     denseScore: 0.99 - index * 0.01,
-    baselineScore: 0.99 - index * 0.01,
     createdAt: OLD,
   }));
 }
@@ -68,7 +65,6 @@ function semanticDistractors(prefix: string, count: number, start = 0.94): Candi
     content: `Broad background summary ${index} without the decisive evidence.`,
     vectorContent: `Broad background summary ${index}.`,
     denseScore: start - index * 0.01,
-    baselineScore: start - index * 0.01,
     createdAt: OLD,
   }));
 }
@@ -89,13 +85,11 @@ function crowdedCandidates(
       content: "A compact decision marker whose parent text omits the query wording.",
       vectorContent: rootChunk,
       denseScore: 0.76,
-      baselineScore: 0.5,
       createdAt: OLD,
     },
     ...Array.from({ length: 4 }, (_, index) => ({
       id: `${prefix}-keyword-${index}`,
       content: `${keywordText} background index ${index}.`,
-      baselineScore: 0.7 - index * 0.01,
       keywordCandidate: true,
       createdAt: OLD,
     })),
@@ -119,7 +113,6 @@ function popularityCandidates(
       content: "A specific decision marker with intentionally neutral lexical evidence.",
       vectorContent: "Specific decision marker.",
       denseScore: 0.81,
-      baselineScore: 0.86,
       createdAt: OLD,
     },
     {
@@ -127,14 +120,12 @@ function popularityCandidates(
       content: "A popular broad summary with no authoritative answer.",
       vectorContent: "Popular broad summary.",
       denseScore: 0.8,
-      baselineScore: 0.85,
       recallCount: 10_000,
       createdAt: OLD,
     },
     {
       id: `${prefix}-keyword-leader`,
       content: keywordText,
-      baselineScore: 0.99,
       keywordCandidate: true,
       createdAt: OLD,
     },
@@ -146,21 +137,25 @@ function longParentCandidates(
   prefix: string,
   rootId: string,
   answerId: string,
-  pollutedSection: string,
-  localChunk: string,
-  answer: string,
+  queryTerms: readonly [string, string, string, string],
 ): CandidateFixture[] {
+  const [first, second, third, fourth] = queryTerms;
   return [
-    ...directCandidates(prefix),
+    ...Array.from({ length: 5 }, (_, index) => ({
+      id: `${prefix}-direct-${index}`,
+      content: `${first} ${second} ${third} replacement evidence ${index}.`,
+      vectorContent: `${first} ${second} ${third} replacement chunk ${index}.`,
+      denseScore: 0.99 - index * 0.01,
+      createdAt: OLD,
+    })),
     {
       id: rootId,
-      content: `${pollutedSection} ${"Unrelated archival material. ".repeat(30)}`,
-      vectorContent: localChunk,
+      content: `${fourth} occurs in an unrelated parent section. ${"Unrelated archival material. ".repeat(30)}`,
+      vectorContent: `${first} ${second} local chunk`,
       denseScore: 0.75,
-      baselineScore: 0.7,
       createdAt: OLD,
     },
-    { id: answerId, content: answer, createdAt: OLD },
+    { id: answerId, content: `${third} ${fourth} linked authoritative evidence.`, createdAt: OLD },
   ];
 }
 
@@ -175,7 +170,6 @@ function weakNeighborCandidates(
   const root: CandidateFixture = {
     id: rootId,
     denseScore: 0.6,
-    baselineScore: 0.6,
     content: "A weakly relevant root marker.",
     vectorContent: "A weakly relevant root marker.",
     createdAt: OLD,
@@ -185,6 +179,165 @@ function weakNeighborCandidates(
 
 function absentCandidates(prefix: string, answerId: string): CandidateFixture[] {
   return [...directCandidates(prefix), { id: answerId, content: "Authoritative evidence outside the raw pool.", createdAt: OLD }];
+}
+
+function holdoutDirectCandidates(
+  prefix: string,
+  count: number,
+  start: number,
+  step: number,
+  authoritativeFifthId?: string,
+): CandidateFixture[] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: index === 4 && authoritativeFifthId ? authoritativeFifthId : `${prefix}-direct-${index}`,
+    content: index === 4 && authoritativeFifthId
+      ? "The controlled holdout record contains the authoritative current answer."
+      : `Holdout direct record ${index} with a distinct score geometry.`,
+    vectorContent: `Holdout direct evidence ${index}.`,
+    denseScore: start - index * step,
+    createdAt: OLD + index,
+    recallCount: index === 1 ? 3 : 0,
+  }));
+}
+
+function holdoutCrowdedCandidates(
+  prefix: string,
+  rootId: string,
+  answerId: string,
+  rootChunk: string,
+  answer: string,
+  keywordText: string,
+  directCount: number,
+  semanticCount: number,
+  keywordCount: number,
+  rootScore: number,
+): CandidateFixture[] {
+  return [
+    ...holdoutDirectCandidates(prefix, directCount, 0.995, 0.013),
+    ...Array.from({ length: semanticCount }, (_, index) => ({
+      id: `${prefix}-semantic-${index}`,
+      content: `Holdout background cluster ${index} without the linked decision.`,
+      vectorContent: `Holdout background vector ${index}.`,
+      denseScore: 0.89 - index * 0.017,
+      createdAt: 30 + index,
+      recallCount: index === 0 ? 11 : 0,
+    })),
+    { id: rootId, content: "A terse holdout root parent.", vectorContent: rootChunk, denseScore: rootScore, createdAt: 17 },
+    ...Array.from({ length: keywordCount }, (_, index) => ({
+      id: `${prefix}-keyword-${index}`,
+      content: `${keywordText} alternate lexical distractor ${index}.`,
+      keywordCandidate: true,
+      createdAt: 80 - index * 2,
+      recallCount: index === keywordCount - 1 ? 5 : 0,
+    })),
+    { id: answerId, content: answer, createdAt: 9 },
+    { id: `${prefix}-edge-decoy`, content: "A linked but irrelevant holdout branch.", createdAt: 8 },
+  ];
+}
+
+function holdoutPopularCandidates(
+  prefix: string,
+  rootId: string,
+  popularId: string,
+  answerId: string,
+  rootChunk: string,
+  answer: string,
+  keywordText: string,
+  directCount: number,
+  semanticCount: number,
+  keywordCount: number,
+  recallCount: number,
+): CandidateFixture[] {
+  return [
+    ...holdoutDirectCandidates(prefix, directCount, 0.997, 0.011),
+    ...Array.from({ length: semanticCount }, (_, index) => ({
+      id: `${prefix}-semantic-${index}`,
+      content: `Holdout operating summary ${index}.`,
+      vectorContent: `Operating summary vector ${index}.`,
+      denseScore: 0.9 - index * 0.019,
+      createdAt: 44 + index,
+      recallCount: index === 1 ? 7 : 0,
+    })),
+    { id: rootId, content: "Specific holdout decision marker.", vectorContent: rootChunk, denseScore: 0.765, createdAt: 12 },
+    { id: popularId, content: "Frequently recalled broad holdout digest.", vectorContent: "Broad digest.", denseScore: 0.735, recallCount, createdAt: 3 },
+    ...Array.from({ length: keywordCount }, (_, index) => ({
+      id: `${prefix}-keyword-${index}`,
+      content: `${keywordText} broad lexical digest ${index}.`,
+      keywordCandidate: true,
+      createdAt: 100 - index,
+      recallCount: index === 0 ? 19 : 0,
+    })),
+    { id: answerId, content: answer, createdAt: 2 },
+    { id: `${prefix}-edge-decoy`, content: "An irrelevant but linked digest branch.", createdAt: 1 },
+  ];
+}
+
+function holdoutLongCandidates(
+  prefix: string,
+  rootId: string,
+  answerId: string,
+  queryTerms: readonly [string, string, string, string],
+  directCount: number,
+  tailCount: number,
+): CandidateFixture[] {
+  const [first, second, third, fourth] = queryTerms;
+  return [
+    ...Array.from({ length: directCount }, (_, index) => ({
+      id: `${prefix}-direct-${index}`,
+      content: `${first} ${second} ${third} replacement evidence ${index}.`,
+      vectorContent: `${first} ${second} ${third} replacement chunk ${index}.`,
+      denseScore: 0.996 - index * 0.014,
+      createdAt: 70 + index,
+      recallCount: index === 2 ? 9 : 0,
+    })),
+    ...Array.from({ length: tailCount }, (_, index) => ({
+      id: `${prefix}-tail-${index}`,
+      content: `Holdout tail distractor ${index}.`,
+      vectorContent: `Tail vector ${index}.`,
+      denseScore: 0.78 - index * 0.021,
+      createdAt: 40 + index,
+    })),
+    {
+      id: rootId,
+      content: `${fourth} appears in an unrelated archival section. ${"Neutral archive text. ".repeat(28)}`,
+      vectorContent: `${first} ${second} local chunk`,
+      denseScore: 0.69,
+      createdAt: 13,
+    },
+    { id: answerId, content: `${third} ${fourth} linked authoritative evidence.`, createdAt: 6 },
+    { id: `${prefix}-edge-decoy`, content: `${first} generic branch only.`, createdAt: 5 },
+  ];
+}
+
+function holdoutWeakCandidates(
+  prefix: string,
+  authoritativeId: string,
+  rootId: string,
+  weakId: string,
+  weakContent: string,
+  tailCount: number,
+  rootScore: number,
+): CandidateFixture[] {
+  return [
+    ...holdoutDirectCandidates(prefix, 5, 0.998, 0.012, authoritativeId),
+    ...Array.from({ length: tailCount }, (_, index) => ({
+      id: `${prefix}-tail-${index}`,
+      content: `Non-authoritative holdout tail ${index}.`,
+      vectorContent: `Tail ${index}.`,
+      denseScore: rootScore + 0.035 - index * 0.08,
+      createdAt: 20 + index,
+      recallCount: index === 0 ? 13 : 0,
+    })),
+    { id: rootId, content: "Low-ranked holdout root.", vectorContent: "Low-ranked root.", denseScore: rootScore, createdAt: 4 },
+    { id: weakId, content: weakContent, createdAt: 3 },
+  ];
+}
+
+function holdoutAbsentCandidates(prefix: string, answerId: string, denseCount: number): CandidateFixture[] {
+  return [
+    ...holdoutDirectCandidates(prefix, denseCount, 0.996, 0.018),
+    { id: answerId, content: "Authoritative holdout evidence outside both raw arms.", createdAt: 2 },
+  ];
 }
 
 const decided = (sourceId: string, targetId: string): EdgeFixture => ({
@@ -219,23 +372,29 @@ export const ROOT_QUALITY_CASES: readonly RootQualityCase[] = [
   },
   {
     split: "holdout", domain: "personal", failureShape: "popular-broad-summary",
-    query: "why did the harbor schedule change", intent: "causal",
-    candidates: popularityCandidates("personal-popular", "personal-popular-root", "personal-popular-summary", "personal-popular-answer", "The harbor schedule changed because the permit window moved.", "harbor schedule change"),
-    edges: [decided("personal-popular-root", "personal-popular-answer")],
+    query: "which harbor rota policy remains active now", intent: "current",
+    candidates: holdoutPopularCandidates("personal-popular", "personal-popular-root", "personal-popular-summary", "personal-popular-answer", "harbor rota policy", "The active harbor rota policy assigns the west team each Friday.", "harbor rota", 6, 6, 4, 50_000),
+    edges: [
+      { sourceId: "personal-popular-root", targetId: "personal-popular-answer", type: "supersedes", weight: 0.81, provenance: "system" },
+      { sourceId: "personal-popular-root", targetId: "personal-popular-edge-decoy", type: "relates_to", weight: 0.42, provenance: "inferred" },
+    ],
     authoritativeIds: ["personal-popular-answer"], acceptableRootIds: ["personal-popular-root"], candidateAvailable: true,
   },
   {
     split: "development", domain: "personal", failureShape: "long-parent-pollution",
-    query: "why did the maple booking change", intent: "causal",
-    candidates: longParentCandidates("personal-long", "personal-long-root", "personal-long-answer", "Maple booking change venue", "maple planning context", "The booking changed venue after the maple room became unavailable."),
+    query: "maple venue booking permit", intent: "direct",
+    candidates: longParentCandidates("personal-long", "personal-long-root", "personal-long-answer", ["maple", "venue", "booking", "permit"]),
     edges: [decided("personal-long-root", "personal-long-answer")],
     authoritativeIds: ["personal-long-answer"], acceptableRootIds: ["personal-long-root"], candidateAvailable: true,
   },
   {
     split: "holdout", domain: "personal", failureShape: "weak-generic-neighbor",
-    query: "neighborhood budget status review planning update summary", intent: "direct",
-    candidates: weakNeighborCandidates("personal-weak", "personal-weak-direct-answer", "personal-weak-root", "personal-weak-neighbor", "Neighborhood budget overview."),
-    edges: [weak("personal-weak-root", "personal-weak-neighbor")],
+    query: "neighborhood allocation status planning review update summary notes archive", intent: "direct",
+    candidates: holdoutWeakCandidates("personal-weak", "personal-weak-direct-answer", "personal-weak-root", "personal-weak-neighbor", "Neighborhood allocation overview.", 2, 0.52),
+    edges: [
+      { sourceId: "personal-weak-neighbor", targetId: "personal-weak-root", type: "relates_to", weight: 0.18, provenance: "system" },
+      { sourceId: "personal-weak-root", targetId: "personal-weak-tail-1", type: "follows", weight: 0.29, provenance: "inferred" },
+    ],
     authoritativeIds: ["personal-weak-direct-answer"], acceptableRootIds: ["personal-weak-root"], candidateAvailable: true,
   },
   {
@@ -247,9 +406,12 @@ export const ROOT_QUALITY_CASES: readonly RootQualityCase[] = [
 
   {
     split: "holdout", domain: "enterprise", failureShape: "crowded-lexical-root",
-    query: "why did the cobalt runtime change", intent: "causal",
-    candidates: crowdedCandidates("enterprise-crowded", "enterprise-crowded-root", "enterprise-crowded-answer", "cobalt runtime change", "The cobalt runtime changed because the support contract required it.", "cobalt runtime"),
-    edges: [decided("enterprise-crowded-root", "enterprise-crowded-answer")],
+    query: "reason cobalt runtime ownership switched", intent: "causal",
+    candidates: holdoutCrowdedCandidates("enterprise-crowded", "enterprise-crowded-root", "enterprise-crowded-answer", "cobalt runtime ownership", "Cobalt runtime ownership switched because the vendor support boundary moved.", "cobalt runtime", 6, 7, 7, 0.68),
+    edges: [
+      { sourceId: "enterprise-crowded-root", targetId: "enterprise-crowded-answer", type: "caused_by", weight: 0.83, provenance: "system" },
+      { sourceId: "enterprise-crowded-root", targetId: "enterprise-crowded-edge-decoy", type: "relates_to", weight: 0.37, provenance: "inferred" },
+    ],
     authoritativeIds: ["enterprise-crowded-answer"], acceptableRootIds: ["enterprise-crowded-root"], candidateAvailable: true,
   },
   {
@@ -261,9 +423,12 @@ export const ROOT_QUALITY_CASES: readonly RootQualityCase[] = [
   },
   {
     split: "holdout", domain: "enterprise", failureShape: "long-parent-pollution",
-    query: "what happened before the ember migration", intent: "chronology",
-    candidates: longParentCandidates("enterprise-long", "enterprise-long-root", "enterprise-long-answer", "Ember migration before sequence", "ember planning context", "Before the ember migration, the compatibility audit closed its final exception."),
-    edges: [decided("enterprise-long-root", "enterprise-long-answer")],
+    query: "ember cutover validation archive", intent: "direct",
+    candidates: holdoutLongCandidates("enterprise-long", "enterprise-long-root", "enterprise-long-answer", ["ember", "cutover", "validation", "archive"], 6, 1),
+    edges: [
+      { sourceId: "enterprise-long-root", targetId: "enterprise-long-answer", type: "follows", weight: 0.84, provenance: "system" },
+      { sourceId: "enterprise-long-root", targetId: "enterprise-long-edge-decoy", type: "relates_to", weight: 0.33, provenance: "inferred" },
+    ],
     authoritativeIds: ["enterprise-long-answer"], acceptableRootIds: ["enterprise-long-root"], candidateAvailable: true,
   },
   {
@@ -275,8 +440,9 @@ export const ROOT_QUALITY_CASES: readonly RootQualityCase[] = [
   },
   {
     split: "holdout", domain: "enterprise", failureShape: "absent-cluster-control",
-    query: "why did the orchid queue change", intent: "causal",
-    candidates: absentCandidates("enterprise-absent", "enterprise-absent-answer"), edges: [],
+    query: "reason orchid scheduler backlog policy shifted recently", intent: "causal",
+    candidates: holdoutAbsentCandidates("enterprise-absent", "enterprise-absent-answer", 7),
+    edges: [{ sourceId: "enterprise-absent-direct-0", targetId: "enterprise-absent-direct-1", type: "follows", weight: 0.31, provenance: "system" }],
     authoritativeIds: ["enterprise-absent-answer"], acceptableRootIds: [], candidateAvailable: false,
   },
 
@@ -289,23 +455,29 @@ export const ROOT_QUALITY_CASES: readonly RootQualityCase[] = [
   },
   {
     split: "holdout", domain: "product", failureShape: "popular-broad-summary",
-    query: "current compass onboarding direction", intent: "current",
-    candidates: popularityCandidates("product-popular", "product-popular-root", "product-popular-summary", "product-popular-answer", "The current compass onboarding direction starts with a guided workspace.", "compass onboarding direction"),
-    edges: [decided("product-popular-root", "product-popular-answer")],
+    query: "which compass activation path is still preferred", intent: "current",
+    candidates: holdoutPopularCandidates("product-popular", "product-popular-root", "product-popular-summary", "product-popular-answer", "compass activation path", "The preferred compass activation path begins with a sample workspace.", "compass activation", 7, 6, 5, 25_000),
+    edges: [
+      { sourceId: "product-popular-root", targetId: "product-popular-answer", type: "caused_by", weight: 0.76, provenance: "inferred" },
+      { sourceId: "product-popular-root", targetId: "product-popular-edge-decoy", type: "relates_to", weight: 0.48, provenance: "system" },
+    ],
     authoritativeIds: ["product-popular-answer"], acceptableRootIds: ["product-popular-root"], candidateAvailable: true,
   },
   {
     split: "development", domain: "product", failureShape: "long-parent-pollution",
-    query: "what happened before the mosaic rollout", intent: "chronology",
-    candidates: longParentCandidates("product-long", "product-long-root", "product-long-answer", "Mosaic rollout before sequence", "mosaic planning context", "Before the mosaic rollout, the activation checklist passed its final trial."),
+    query: "mosaic rollout activation trial", intent: "direct",
+    candidates: longParentCandidates("product-long", "product-long-root", "product-long-answer", ["mosaic", "rollout", "activation", "trial"]),
     edges: [decided("product-long-root", "product-long-answer")],
     authoritativeIds: ["product-long-answer"], acceptableRootIds: ["product-long-root"], candidateAvailable: true,
   },
   {
     split: "holdout", domain: "product", failureShape: "weak-generic-neighbor",
-    query: "product review status planning update summary roadmap", intent: "direct",
-    candidates: weakNeighborCandidates("product-weak", "product-weak-direct-answer", "product-weak-root", "product-weak-neighbor", "Product review overview."),
-    edges: [weak("product-weak-root", "product-weak-neighbor")],
+    query: "catalog review status roadmap planning update summary notes archive trace", intent: "direct",
+    candidates: holdoutWeakCandidates("product-weak", "product-weak-direct-answer", "product-weak-root", "product-weak-neighbor", "Catalog review overview.", 3, 0.46),
+    edges: [
+      { sourceId: "product-weak-neighbor", targetId: "product-weak-root", type: "relates_to", weight: 0.27, provenance: "explicit" },
+      { sourceId: "product-weak-root", targetId: "product-weak-tail-2", type: "supersedes", weight: 0.22, provenance: "system" },
+    ],
     authoritativeIds: ["product-weak-direct-answer"], acceptableRootIds: ["product-weak-root"], candidateAvailable: true,
   },
   {
@@ -317,9 +489,12 @@ export const ROOT_QUALITY_CASES: readonly RootQualityCase[] = [
 
   {
     split: "holdout", domain: "architecture", failureShape: "crowded-lexical-root",
-    query: "why did the quartz cache design change", intent: "causal",
-    candidates: crowdedCandidates("architecture-crowded", "architecture-crowded-root", "architecture-crowded-answer", "quartz cache design", "The quartz cache design changed because invalidation needed one owner.", "quartz cache"),
-    edges: [decided("architecture-crowded-root", "architecture-crowded-answer")],
+    query: "reason quartz invalidation ownership switched", intent: "causal",
+    candidates: holdoutCrowdedCandidates("architecture-crowded", "architecture-crowded-root", "architecture-crowded-answer", "quartz invalidation ownership", "Quartz invalidation ownership switched because one writer had to serialize updates.", "quartz invalidation", 7, 7, 8, 0.61),
+    edges: [
+      { sourceId: "architecture-crowded-root", targetId: "architecture-crowded-answer", type: "supersedes", weight: 0.72, provenance: "inferred" },
+      { sourceId: "architecture-crowded-root", targetId: "architecture-crowded-edge-decoy", type: "follows", weight: 0.39, provenance: "system" },
+    ],
     authoritativeIds: ["architecture-crowded-answer"], acceptableRootIds: ["architecture-crowded-root"], candidateAvailable: true,
   },
   {
@@ -331,9 +506,12 @@ export const ROOT_QUALITY_CASES: readonly RootQualityCase[] = [
   },
   {
     split: "holdout", domain: "architecture", failureShape: "long-parent-pollution",
-    query: "what happened before the lattice storage migration", intent: "chronology",
-    candidates: longParentCandidates("architecture-long", "architecture-long-root", "architecture-long-answer", "Lattice storage migration before", "lattice planning context", "Before the lattice storage migration, the restore rehearsal verified the archive."),
-    edges: [decided("architecture-long-root", "architecture-long-answer")],
+    query: "lattice restore migration checksum", intent: "direct",
+    candidates: holdoutLongCandidates("architecture-long", "architecture-long-root", "architecture-long-answer", ["lattice", "restore", "migration", "checksum"], 7, 1),
+    edges: [
+      { sourceId: "architecture-long-answer", targetId: "architecture-long-root", type: "supersedes", weight: 0.78, provenance: "inferred" },
+      { sourceId: "architecture-long-root", targetId: "architecture-long-edge-decoy", type: "relates_to", weight: 0.26, provenance: "system" },
+    ],
     authoritativeIds: ["architecture-long-answer"], acceptableRootIds: ["architecture-long-root"], candidateAvailable: true,
   },
   {
@@ -345,8 +523,9 @@ export const ROOT_QUALITY_CASES: readonly RootQualityCase[] = [
   },
   {
     split: "holdout", domain: "architecture", failureShape: "absent-cluster-control",
-    query: "why did the horizon protocol change", intent: "causal",
-    candidates: absentCandidates("architecture-absent", "architecture-absent-answer"), edges: [],
+    query: "what became of horizon message ordering after retry redesign", intent: "chronology",
+    candidates: holdoutAbsentCandidates("architecture-absent", "architecture-absent-answer", 8),
+    edges: [{ sourceId: "architecture-absent-direct-2", targetId: "architecture-absent-direct-5", type: "decided", weight: 0.44, provenance: "inferred" }],
     authoritativeIds: ["architecture-absent-answer"], acceptableRootIds: [], candidateAvailable: false,
   },
 ];
