@@ -106,15 +106,23 @@ describe("recall root selection", () => {
   it("uses a query-relevant local chunk instead of an unrelated parent section", async () => {
     const db = new D1Mock();
     seed(db, "chunk-root", "unrelated parent section");
-    seed(db, "chunk-answer", "beta gamma evidence");
+    seed(db, "chunk-answer", "gamma delta evidence");
     seed(db, "unrelated-neighbor", "grocery list");
     edge(db, "chunk-root", "chunk-answer");
     edge(db, "chunk-root", "unrelated-neighbor");
-    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{
-      id: "chunk-root", score: .8, metadata: { parentId: "chunk-root", content: "alpha local chunk" },
-    }] }) }) });
+    for (let i = 0; i < 5; i++) seed(db, `direct-${i}`, "alpha beta gamma direct evidence");
+    const prepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+      ? { bind: () => ({ all: async () => ({ results: [] }) }) }
+      : prepare(sql);
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
+      ...Array.from({ length: 5 }, (_, i) => ({ id: `direct-${i}`, score: .9 - i * .01, metadata: { parentId: `direct-${i}` } })),
+      { id: "chunk-root", score: .5, metadata: { parentId: "chunk-root", content: "alpha beta local chunk" } },
+    ] }) }) });
 
-    const result = await recallEntries({ query: "alpha beta gamma", topK: 5, hops: 1, synthesize: false }, env, ctx);
+    const diagnostics: RecallDiagnostics = {};
+    const result = await recallEntries({ query: "alpha beta gamma delta", topK: 5, hops: 1, synthesize: false }, env, ctx, undefined, { diagnostics });
+    expect(diagnostics.rejections).not.toContainEqual({ id: "chunk-answer", reason: "no-evidence-gain" });
     expect(result.matches.map(match => match.id)).toContain("chunk-answer");
     expect(result.matches.map(match => match.id)).not.toContain("unrelated-neighbor");
   });
