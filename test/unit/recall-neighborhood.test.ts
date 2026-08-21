@@ -123,6 +123,20 @@ describe("deterministic linked-evidence scoring", () => {
     expect(score.rejection).toBe("weak-neighborhood");
   });
 
+  it("rejects linked evidence that only contains a query token as a substring", () => {
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentContent: "Ledger status changed",
+      content: "The ledgering job completed",
+      queryTokens: ["ledger", "status"],
+      corpus: { df: new Map([["ledger", 90], ["status", 80]]), total: 100 },
+      replacementCoverage: 0,
+    });
+
+    expect(score.eligible).toBe(false);
+    expect(score.rejection).toBe("weak-neighborhood");
+  });
+
   const qualifying = {
     ...base,
     parentContent: "The backend direction changed",

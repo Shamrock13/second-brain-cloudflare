@@ -432,11 +432,12 @@ export class D1Mock {
             .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
           return { results };
         }
-        if (s.includes("SELECT id, recall_count, importance_score") && s.includes("WHERE id IN")) {
+        if (s.includes("SELECT id, content, recall_count, importance_score") && s.includes("WHERE id IN")) {
           const results = db.entries
             .filter((e: any) => args.includes(e.id))
             .map((e: any) => ({
               id: e.id,
+              content: e.content,
               recall_count: e.recall_count ?? 0,
               importance_score: e.importance_score ?? 0,
               contradiction_wins: e.contradiction_wins ?? 0,

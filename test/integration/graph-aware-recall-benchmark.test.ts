@@ -30,7 +30,7 @@ function fixture(c: typeof cases[number]) {
   for (let i = 0; i < 5; i++) {
     db.entries.push({
       id: `${c.domain}-direct-${i}`,
-      content: `${c.query} unrelated direct note ${i}`,
+      content: `unrelated direct note ${i}`,
       tags: "[]",
       source: "api",
       created_at: 2000 - i,
@@ -43,7 +43,7 @@ function fixture(c: typeof cases[number]) {
   const answerId = `${c.domain}-answer`;
   db.entries.push({
     id: rootId,
-    content: `${c.query} decision root`,
+    content: "decision root",
     tags: "[]",
     source: "api",
     created_at: 1000,
@@ -53,7 +53,7 @@ function fixture(c: typeof cases[number]) {
   });
   db.entries.push({
     id: answerId,
-    content: c.answer,
+    content: `${c.query} ${c.answer}`,
     tags: "[]",
     source: "api",
     created_at: 900,

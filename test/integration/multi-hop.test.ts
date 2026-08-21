@@ -189,11 +189,11 @@ describe("multi-hop recall (issue #16)", () => {
 
   it("surfaces relevant linked evidence from a root just outside direct topK", async () => {
     for (let i = 0; i < 5; i++) {
-      seed(db, `direct-${i}`, `why anniversary changed distraction ${i}`);
+      seed(db, `direct-${i}`, `anniversary distraction ${i}`);
       (db.entries.at(-1) as any).created_at = 2000 - i;
     }
-    seed(db, "candidate-root", "why anniversary changed because the original trip was impractical");
-    seed(db, "linked-answer", "Chateau Elan solved the anniversary sitter constraint");
+    seed(db, "candidate-root", "the anniversary plan was blocked by the original trip");
+    seed(db, "linked-answer", "Chateau Elan changed the sitter constraint");
     db.edges.push({
       id: "candidate-answer",
       source_id: "candidate-root",

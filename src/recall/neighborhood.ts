@@ -92,14 +92,6 @@ export function queryCoverage(
 
 const clamp = (value: number) => Math.max(0, Math.min(1, value));
 
-function exactMatchCount(content: string, tokens: string[]): number {
-  const lower = content.toLowerCase();
-  return new Set(tokens.map(t => t.toLowerCase()).filter(Boolean)).size === 0
-    ? 0
-    : [...new Set(tokens.map(t => t.toLowerCase()).filter(Boolean))]
-      .filter(token => new RegExp(`(?<![\\w])${escapeRegExp(token)}(?![\\w])`).test(lower)).length;
-}
-
 export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvidenceScore {
   const parentCoverage = queryCoverage(input.parentContent, input.queryTokens, input.corpus).score;
   const linked = queryCoverage(input.content, input.queryTokens, input.corpus);
@@ -114,7 +106,6 @@ export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvi
     return { eligible: false, score: 0, coverage: linkedCoverage, coverageGain, rejection: "no-linked-evidence" };
   }
 
-  const hasPreciseLinkedEvidence = linked.exactHighIdf || exactMatchCount(input.content, input.queryTokens) >= 2;
   const rootRelevance = clamp(input.parentScore * Math.pow(clamp(input.hopDecay), input.hop));
 
   const provenanceFactor = input.provenance === "explicit"
@@ -131,8 +122,7 @@ export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvi
     + WEIGHT.provenance * provenanceFactor
     + WEIGHT.intent * edgeIntentCompatibility(input.intent, input.edgeType),
   );
-  const meetsLinkedEvidenceGate = (linkedCoverage >= MIN_LINKED_COVERAGE || linked.exactHighIdf)
-    && hasPreciseLinkedEvidence;
+  const meetsLinkedEvidenceGate = linkedCoverage >= MIN_LINKED_COVERAGE || linked.exactHighIdf;
   if (!meetsLinkedEvidenceGate || score < MIN_NEIGHBORHOOD_SCORE) {
     return { eligible: false, score: 0, coverage: linkedCoverage, coverageGain, rejection: "weak-neighborhood" };
   }

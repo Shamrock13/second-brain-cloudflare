@@ -1,4 +1,6 @@
 import type { EdgeProvenance, EdgeType } from "../graph/types";
+import type { EmbeddingQueryMode } from "./query-profile";
+import type { RootView } from "./root-selector";
 
 export interface CompoundStaleSignal {
   count: number;
@@ -32,6 +34,21 @@ export interface RecallSearchResult {
   // memory has to be shortened for the response.
   queryTokens?: string[];
   compoundStale?: CompoundStaleSignal;
+}
+
+export interface RecallDiagnostics {
+  embeddingMode?: EmbeddingQueryMode;
+  candidateIds?: string[];
+  fusedIds?: string[];
+  rootSelections?: { id: string; selectedBy: RootView }[];
+  expandedIds?: string[];
+  selectedRelatedIds?: string[];
+  rejections?: { id: string; reason: string }[];
+}
+
+export interface RecallInternalOptions {
+  embeddingQueryMode?: EmbeddingQueryMode;
+  diagnostics?: RecallDiagnostics;
 }
 
 export interface KeywordRow {
