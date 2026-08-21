@@ -242,7 +242,29 @@ describe("deterministic linked-evidence scoring", () => {
     });
 
     expect(score.eligible).toBe(false);
-    expect(score.rejection).toBe("no-linked-evidence");
+    expect(score.rejection).toBe("weak-neighborhood");
+  });
+
+  it("keeps localized linked evidence at the start of a long memory", () => {
+    const content = `alpha beta ${"noise ".repeat(100)}`;
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentScore: 1,
+      parentContent: "root context",
+      content,
+      queryTokens: ["alpha", "beta"],
+      evidenceTokens: ["alpha", "beta"],
+      corpus: { df: null, total: null },
+      edgeWeight: 1,
+      replacementCoverage: 0,
+      intent: "causal",
+      edgeType: "decided",
+    });
+
+    expect(content.length).toBeGreaterThan(400);
+    expect(score.rejection).toBeUndefined();
+    expect(score.eligible).toBe(true);
+    expect(score.coverage).toBe(1);
   });
 
   it("abstains when the neighborhood does not improve on the replaced direct evidence", () => {

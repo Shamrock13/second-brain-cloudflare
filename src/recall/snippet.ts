@@ -138,7 +138,9 @@ function bestMatchWindow(text: string, tokens: string[], width: number): string 
   // Back up slightly so the match is not flush against the left edge, then drop
   // any partial leading word.
   const start = Math.max(0, best.start - Math.floor(width * 0.15));
-  return text.slice(start, start + width).replace(/^\S*\s+/, "");
+  const window = text.slice(start, start + width);
+  const startsInsideWord = start > 0 && /\S/.test(text[start - 1]) && /\S/.test(text[start]);
+  return startsInsideWord ? window.replace(/^\S*\s+/, "") : window;
 }
 
 export function queryRelevantWindow(content: string, queryTokens: string[], maxChars = 400): string {

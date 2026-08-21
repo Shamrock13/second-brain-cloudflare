@@ -152,7 +152,36 @@ describe("recall root selection", () => {
     );
 
     expect(result.matches.map(match => match.id)).toEqual(["long-root"]);
-    expect(diagnostics.rejections).toContainEqual({ id: "long-neighbor", reason: "no-linked-evidence" });
+    expect(diagnostics.rejections).toContainEqual({ id: "long-neighbor", reason: "weak-neighborhood" });
+  });
+
+  it("returns full long linked content when localized evidence begins at offset zero", async () => {
+    const db = new D1Mock();
+    seed(db, "localized-root", "root context");
+    const content = `alpha beta ${"noise ".repeat(100)}`;
+    seed(db, "localized-neighbor", content);
+    edge(db, "localized-root", "localized-neighbor");
+    const prepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+      ? { bind: () => ({ all: async () => ({ results: [] }) }) }
+      : prepare(sql);
+    const diagnostics: RecallDiagnostics = {};
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
+      { id: "localized-root", score: .9, metadata: { parentId: "localized-root" } },
+    ] }) }) });
+
+    const result = await recallEntries(
+      { query: "alpha beta", topK: 5, hops: 1, synthesize: false },
+      env,
+      ctx,
+      undefined,
+      { diagnostics },
+    );
+
+    expect(content.length).toBeGreaterThan(400);
+    expect(result.matches.map(match => match.id)).toEqual(["localized-root", "localized-neighbor"]);
+    expect(result.matches.find(match => match.id === "localized-neighbor")?.content).toBe(content);
+    expect(diagnostics.rejections).not.toContainEqual({ id: "localized-neighbor", reason: "weak-neighborhood" });
   });
 
   it("selects candidate content only for graph-aware recalls", async () => {
