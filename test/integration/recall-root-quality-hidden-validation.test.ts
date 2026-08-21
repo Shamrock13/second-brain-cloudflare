@@ -426,10 +426,8 @@ describe("hidden recall validation structure", () => {
   });
 });
 
-const decisionTest = process.env.HIDDEN_VALIDATION_DECISION === "1" ? it : it.skip;
-
-describe("sealed hidden recall validation decision", () => {
-  decisionTest("runs the frozen ten-case ship gates exactly once", async () => {
+describe("sealed hidden recall validation regression", () => {
+  it("enforces the frozen ten-case ship gates", async () => {
     const { observations, metrics } = await evaluate(HIDDEN_VALIDATION_CASES);
     const byDomain = Object.fromEntries(
       (["personal", "enterprise", "product", "architecture"] as const).map(domain => [

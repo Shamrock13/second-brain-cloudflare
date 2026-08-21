@@ -10,7 +10,8 @@ committed before the observational metrics audit and were not changed afterward.
 - Compile-only tuple fix commit: `c808f48c524f867199262cfc05baafb8bab20917`
 - Audited pre-fix fixture blob: `2578620ae2768fd9cdf1e6efbb4ff7dc7cb3a030`
 - Final fixture blob: `a8a5f75b4f2edc9ff65c0a3d4667970e1f67540e`
-- Benchmark blob: `5b6502e8a3f6987e90024c794ed6df374d5707aa`
+- Audited benchmark blob: `5b6502e8a3f6987e90024c794ed6df374d5707aa`
+- Final regression-enabled benchmark blob: `64aacc98c2f093ebaee8cde53ee14f1377ca58e4`
 - Manifest SHA-256: `319c2553d379d2bf215f97ae89018e01658de15f8ddaceb21feda38f67ee9462`
 - Serialization: UTF-8 bytes of `JSON.stringify(manifest)`, insertion-order v1,
   with no trailing newline.
@@ -156,3 +157,17 @@ No new absolute authoritative-answer threshold was introduced.
   1,855 tests passed, and the gated decision test was the sole skip.
 - The decision environment variable was absent during the full suite, so the sealed
   decision set did not execute again.
+
+## Ongoing regression status
+
+After the sole decision and observational audit were frozen, the aggregate ship
+assertions were enabled for normal test runs. Future executions use the same sealed
+manifest, cases, faithful baseline, and gates as regression verification; they are
+not new holdout decisions and do not authorize tuning. The runner-only change
+removes the environment skip and renames the test as a regression. It does not
+alter any case, oracle, score, topology, production code, baseline, metric, or gate.
+
+Final verification after enabling the permanent regression: `npm run typecheck`
+exited 0, and `npm test -- --reporter=dot` passed 151/151 files and all
+1,856/1,856 tests with no skips. The hidden aggregate ran as regression
+verification and reproduced its passing assertions.
