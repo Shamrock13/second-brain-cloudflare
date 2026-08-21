@@ -226,10 +226,8 @@ export async function recallEntries(
   const contradictionWins = new Map(rcRows.map(r => [r.id, r.contradiction_wins ?? 0]));
   const contradictionLosses = new Map(rcRows.map(r => [r.id, r.contradiction_losses ?? 0]));
   const d1Tags = new Map(rcRows.map(r => [r.id, JSON.parse(r.tags ?? "[]") as string[]]));
-  const candidateContent = new Map(rcRows.map(r => [r.id, r.content ?? ""]));
 
   const directReranked = rerankWithTimeDecay(fusedMatches, recallCounts, importanceScores, queryTags, contradictionWins, contradictionLosses, d1Tags, cfg);
-  const rootReranked = rerankWithTimeDecay(fusedMatches, recallCounts, importanceScores, queryTags, contradictionWins, contradictionLosses, d1Tags, cfg, { useRecallFrequency: false });
   internal.diagnostics && (internal.diagnostics.candidateIds = directReranked.map(m => ((m.metadata as any)?.parentId ?? m.id) as string));
 
   const seen = new Set<string>();
@@ -244,25 +242,28 @@ export async function recallEntries(
   if (!directCandidates.length) return { matches: [], insight: "", semanticUnavailable };
 
   const directParentIds = directCandidates.map((m) => (m.metadata as any)?.parentId ?? m.id);
-  const rootSeen = new Set<string>();
-  const rootCandidates: RootCandidate[] = rootReranked.flatMap(match => {
-    const parentId = ((match.metadata as any)?.parentId ?? match.id) as string;
-    if (rootSeen.has(parentId)) return [];
-    rootSeen.add(parentId);
-    const tags = d1Tags.get(parentId) ?? [];
-    const localEvidence = localEvidenceOf(match, candidateContent.get(parentId) ?? "", tokens);
-    const tagAlignment = queryTags.length ? tags.filter(value => queryTags.includes(value)).length / queryTags.length : 0;
-    const episodicAlignment = ["causal", "chronology"].includes(profile.intent) && tags.includes("kind:episodic") ? 1 : 0;
-    const authorityAlignment = ["current", "direct"].includes(profile.intent) && tags.includes("status:canonical") ? 1 : 0;
-    return [{ ...match, parentId, rootScore: match.score, localEvidence, tags,
-      lexicalCoverage: queryCoverage(localEvidence, tokens, distilled).score,
-      metadataAlignment: Math.min(1, .6 * tagAlignment + .2 * episodicAlignment + .2 * authorityAlignment) }];
-  });
-  const selectedRoots = hops > 0
-    ? selectGraphRoots(rootCandidates, graphSeedLimit(topK, rootCandidates.length), cfg.MMR_LAMBDA)
-    : [];
+  let selectedRoots: ReturnType<typeof selectGraphRoots> = [];
+  if (hops > 0) {
+    const candidateContent = new Map(rcRows.map(r => [r.id, r.content ?? ""]));
+    const rootReranked = rerankWithTimeDecay(fusedMatches, recallCounts, importanceScores, queryTags, contradictionWins, contradictionLosses, d1Tags, cfg, { useRecallFrequency: false });
+    const rootSeen = new Set<string>();
+    const rootCandidates: RootCandidate[] = rootReranked.flatMap(match => {
+      const parentId = ((match.metadata as any)?.parentId ?? match.id) as string;
+      if (rootSeen.has(parentId)) return [];
+      rootSeen.add(parentId);
+      const tags = d1Tags.get(parentId) ?? [];
+      const localEvidence = localEvidenceOf(match, candidateContent.get(parentId) ?? "", tokens);
+      const tagAlignment = queryTags.length ? tags.filter(value => queryTags.includes(value)).length / queryTags.length : 0;
+      const episodicAlignment = ["causal", "chronology"].includes(profile.intent) && tags.includes("kind:episodic") ? 1 : 0;
+      const authorityAlignment = ["current", "direct"].includes(profile.intent) && tags.includes("status:canonical") ? 1 : 0;
+      return [{ ...match, parentId, rootScore: match.score, localEvidence, tags,
+        lexicalCoverage: queryCoverage(localEvidence, tokens, distilled).score,
+        metadataAlignment: Math.min(1, .6 * tagAlignment + .2 * episodicAlignment + .2 * authorityAlignment) }];
+    });
+    selectedRoots = selectGraphRoots(rootCandidates, graphSeedLimit(topK, rootCandidates.length), cfg.MMR_LAMBDA);
+  }
   const graphSeedIds = selectedRoots.map(x => x.candidate.parentId);
-  if (internal.diagnostics) {
+  if (internal.diagnostics && hops > 0) {
     internal.diagnostics.rootSelections = selectedRoots.map(x => ({ id: x.candidate.parentId, selectedBy: x.selectedBy }));
     internal.diagnostics.rejections = [];
   }
@@ -271,7 +272,7 @@ export async function recallEntries(
   if (hops > 0) {
     expanded = await expandGraph(graphSeedIds, { hops }, env, cfg);
   }
-  internal.diagnostics && (internal.diagnostics.expandedIds = expanded.map(x => x.id));
+  if (internal.diagnostics && hops > 0) internal.diagnostics.expandedIds = expanded.map(x => x.id);
 
   // The graph view can include up to 50 roots and 50 expanded nodes in addition
   // to direct candidates. Keep the union unique and chunked: with a topK above
@@ -321,7 +322,8 @@ export async function recallEntries(
     }];
   }).sort((a, b) => b.score - a.score);
 
-  const maximumRootScore = Math.max(...selectedRoots.map(x => x.candidate.rootScore), 1);
+  const maximumRootScore = Math.max(...selectedRoots.map(x => x.candidate.rootScore));
+  const normalizedRootDivisor = maximumRootScore > 0 ? maximumRootScore : 1;
   const rootById = new Map(selectedRoots.map(x => [x.candidate.parentId, x.candidate]));
   const rootIdByNode = new Map(selectedRoots.map(x => [x.candidate.parentId, x.candidate.parentId]));
   const fallbackRootScore = directCandidates.at(-1)?.score ?? 0;
@@ -335,7 +337,7 @@ export async function recallEntries(
     const row = d1Map.get(e.id);
     if (!row) return [];
     const root = rootById.get(rootIdByNode.get(e.id) ?? "");
-    const rootScore = root ? root.rootScore / maximumRootScore : fallbackRootScore;
+    const rootScore = root ? root.rootScore / normalizedRootDivisor : fallbackRootScore;
     const evidence = scoreLinkedEvidence({
       parentScore: rootScore,
       parentContent: root?.localEvidence ?? "",
@@ -375,7 +377,7 @@ export async function recallEntries(
   const sortedExpanded = expandedMatches
     .sort((a, b) => b.match.score - a.match.score || a.match.id.localeCompare(b.match.id));
   const selectedRelated = sortedExpanded
-    .filter(e => e.eligible)
+    .filter(e => e.eligible && !directParentIds.includes(e.match.id))
     .slice(0, relatedLimit)
     .map(e => e.match);
   if (internal.diagnostics) internal.diagnostics.selectedRelatedIds = selectedRelated.map(x => x.id);

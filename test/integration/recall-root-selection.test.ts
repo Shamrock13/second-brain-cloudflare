@@ -14,7 +14,7 @@ const edge = (db: D1Mock, source_id: string, target_id: string) =>
 describe("recall root selection", () => {
   it("selects a rare lexical root crowded below semantic leaders", async () => {
     const db = new D1Mock();
-    for (let i = 0; i < 5; i++) seed(db, `semantic-${i}`, `general summary ${i}`);
+    for (let i = 0; i < 16; i++) seed(db, `semantic-${i}`, `general summary ${i}`);
     seed(db, "ledger-root", "ledger status changed", ["work"]);
     seed(db, "ledger-answer", "The ledger reconciliation decision fixed the status", ["work"]);
     edge(db, "ledger-root", "ledger-answer");
@@ -24,7 +24,7 @@ describe("recall root selection", () => {
       : prepare(sql);
     const diagnostics: RecallDiagnostics = {};
     const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
-      ...Array.from({ length: 5 }, (_, i) => ({ id: `semantic-${i}`, score: .95 - i * .01, metadata: { parentId: `semantic-${i}` } })),
+      ...Array.from({ length: 16 }, (_, i) => ({ id: `semantic-${i}`, score: .95 - i * .01, metadata: { parentId: `semantic-${i}` } })),
       { id: "ledger-root", score: .5, metadata: { parentId: "ledger-root" } },
     ] }) }) });
 
@@ -45,6 +45,78 @@ describe("recall root selection", () => {
     expect(result.matches.map(x => x.id)).toEqual(["d0", "d1", "d2", "d3", "d4"]);
     expect(diagnostics.selectedRelatedIds).toEqual([]);
     expect(result.matches.map(x => x.id)).not.toContain("unrelated-neighbor");
+  });
+
+  it("does not populate root-selection diagnostics at hops:0", async () => {
+    const db = new D1Mock();
+    seed(db, "direct", "direct status", ["work"]);
+    const diagnostics: RecallDiagnostics = {};
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{ id: "direct", score: .9, metadata: { parentId: "direct" } }] }) }) });
+
+    await recallEntries({ query: "direct status", topK: 5, hops: 0, synthesize: false }, env, ctx, undefined, { diagnostics });
+    expect(diagnostics.rootSelections).toBeUndefined();
+    expect(diagnostics.expandedIds).toBeUndefined();
+  });
+
+  it("never returns a direct candidate again as a graph-hop result", async () => {
+    const db = new D1Mock();
+    seed(db, "d0", "alpha root");
+    seed(db, "d1", "other");
+    seed(db, "d2", "alpha beta evidence");
+    seed(db, "d3", "other three");
+    seed(db, "d4", "other four");
+    edge(db, "d0", "d2");
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
+      ...["d0", "d1", "d2", "d3", "d4"].map((id, i) => ({ id, score: .9 - i * .01, metadata: { parentId: id } })),
+    ] }) }) });
+
+    const result = await recallEntries({ query: "alpha beta", topK: 5, hops: 1, synthesize: false }, env, ctx);
+    expect(new Set(result.matches.map(match => match.id)).size).toBe(result.matches.length);
+    expect(result.matches.filter(match => match.hop > 0).map(match => match.id)).not.toContain("d2");
+  });
+
+  it("normalizes a selected root against the actual positive root maximum", async () => {
+    const db = new D1Mock();
+    seed(db, "low-root", "alpha beta gamma");
+    seed(db, "normalized-answer", "delta epsilon evidence");
+    edge(db, "low-root", "normalized-answer");
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{ id: "low-root", score: .1, metadata: { parentId: "low-root" } }] }) }) });
+
+    const result = await recallEntries({ query: "alpha beta gamma delta epsilon", topK: 5, hops: 1, synthesize: false }, env, ctx);
+    expect(result.matches.map(match => match.id)).toContain("normalized-answer");
+  });
+
+  it("keeps a specific root when direct frequency favors a popular summary", async () => {
+    const db = new D1Mock();
+    seed(db, "popular-summary", "summary", []); (db.entries.at(-1) as any).recall_count = 10_000;
+    seed(db, "specific-root", "alpha beta context");
+    seed(db, "specific-answer", "alpha beta decision evidence");
+    edge(db, "specific-root", "specific-answer");
+    const diagnostics: RecallDiagnostics = {};
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
+      { id: "specific-root", score: .8, metadata: { parentId: "specific-root" } },
+      { id: "popular-summary", score: .7, metadata: { parentId: "popular-summary" } },
+    ] }) }) });
+
+    await recallEntries({ query: "alpha beta", topK: 5, hops: 1, synthesize: false }, env, ctx, undefined, { diagnostics });
+    expect(diagnostics.rootSelections?.map(selection => selection.id)).toContain("specific-root");
+    expect(diagnostics.rootSelections?.[0].id).not.toBe("popular-summary");
+  });
+
+  it("uses a query-relevant local chunk instead of an unrelated parent section", async () => {
+    const db = new D1Mock();
+    seed(db, "chunk-root", "unrelated parent section");
+    seed(db, "chunk-answer", "beta gamma evidence");
+    seed(db, "unrelated-neighbor", "grocery list");
+    edge(db, "chunk-root", "chunk-answer");
+    edge(db, "chunk-root", "unrelated-neighbor");
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{
+      id: "chunk-root", score: .8, metadata: { parentId: "chunk-root", content: "alpha local chunk" },
+    }] }) }) });
+
+    const result = await recallEntries({ query: "alpha beta gamma", topK: 5, hops: 1, synthesize: false }, env, ctx);
+    expect(result.matches.map(match => match.id)).toContain("chunk-answer");
+    expect(result.matches.map(match => match.id)).not.toContain("unrelated-neighbor");
   });
 
   it.each(["distilled", "semantic", "hybrid"] as const)("uses one embedding call in %s mode", async (embeddingQueryMode) => {

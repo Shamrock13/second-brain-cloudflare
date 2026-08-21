@@ -80,13 +80,13 @@ describe("multi-hop recall (issue #16)", () => {
 
   it("hops:1 surfaces a 1-hop neighbor that hops:0 misses, with direct matches still first", async () => {
     seed(db, "seed", "Direct match");
-    seed(db, "neighbor", "Direct related context");
+    seed(db, "neighbor", "Direct match related context");
     pushEdge(db, "seed", "neighbor");
     suppressKeywordSearch(db);
     const env = denseEnv(db, [{ id: "seed", score: 0.9 }]);
     const { ctx } = makeCtx();
 
-    const res = await recallEntries({ query: "direct", topK: 5, hops: 1 }, env, ctx);
+    const res = await recallEntries({ query: "direct match", topK: 5, hops: 1 }, env, ctx);
     expect(res.matches.map(m => m.id)).toEqual(["seed", "neighbor"]);
     expect(res.matches[0].hop).toBe(0);
     expect(res.matches[1].hop).toBe(1);
@@ -95,14 +95,14 @@ describe("multi-hop recall (issue #16)", () => {
   it("applies the related-slot cap when fewer than topK direct rows survive", async () => {
     seed(db, "seed", "Direct match");
     for (let i = 0; i < 3; i++) {
-      seed(db, `neighbor-${i}`, `Direct linked evidence ${i}`);
+      seed(db, `neighbor-${i}`, `Direct match linked evidence ${i}`);
       pushEdge(db, "seed", `neighbor-${i}`, 1 - i * 0.1);
     }
     suppressKeywordSearch(db);
     const env = denseEnv(db, [{ id: "seed", score: 0.9 }]);
     const { ctx } = makeCtx();
 
-    const res = await recallEntries({ query: "direct", topK: 5, hops: 1, synthesize: false }, env, ctx);
+    const res = await recallEntries({ query: "direct match", topK: 5, hops: 1, synthesize: false }, env, ctx);
 
     expect(res.matches.map(m => m.id)).toEqual(["seed", "neighbor-0"]);
   });
@@ -122,13 +122,13 @@ describe("multi-hop recall (issue #16)", () => {
 
   it("carries edge provenance, timestamp, and parent onto a graph-expanded match (#225)", async () => {
     seed(db, "seed", "Direct match");
-    seed(db, "neighbor", "Direct related context");
+    seed(db, "neighbor", "Direct match related context");
     pushEdge(db, "seed", "neighbor"); // pushEdge sets provenance "inferred", created_at 1
     suppressKeywordSearch(db);
     const env = denseEnv(db, [{ id: "seed", score: 0.9 }]);
     const { ctx } = makeCtx();
 
-    const res = await recallEntries({ query: "direct", topK: 5, hops: 1 }, env, ctx);
+    const res = await recallEntries({ query: "direct match", topK: 5, hops: 1 }, env, ctx);
     const hop = res.matches.find(m => m.id === "neighbor")!;
     expect(hop.viaProvenance).toBe("inferred");
     expect(hop.viaFrom).toBe("seed");
@@ -193,7 +193,7 @@ describe("multi-hop recall (issue #16)", () => {
       (db.entries.at(-1) as any).created_at = 2000 - i;
     }
     seed(db, "candidate-root", "the anniversary plan was blocked by the original trip");
-    seed(db, "linked-answer", "Chateau Elan changed the sitter constraint");
+    seed(db, "linked-answer", "Chateau Elan anniversary changed the sitter constraint");
     db.edges.push({
       id: "candidate-answer",
       source_id: "candidate-root",
@@ -267,12 +267,12 @@ describe("multi-hop recall (issue #16)", () => {
     const filtered = build();
 
     const allKinds = await recallEntries(
-      { query: "direct", topK: 5, hops: 2, synthesize: false },
+      { query: "direct causal", topK: 5, hops: 2, synthesize: false },
       unfiltered.env,
       makeCtx().ctx,
     );
     const semanticOnly = await recallEntries(
-      { query: "direct", topK: 5, hops: 2, kind: "semantic", synthesize: false },
+      { query: "direct causal", topK: 5, hops: 2, kind: "semantic", synthesize: false },
       filtered.env,
       makeCtx().ctx,
     );

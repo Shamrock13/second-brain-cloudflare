@@ -65,24 +65,24 @@ describe("DEFAULT_HOPS (#246 connections control)", () => {
   });
 
   it("follows connections when the user raises the default and the caller says nothing", async () => {
-    const res = await recallEntries({ query: "topic", topK: 5 }, env(db, { DEFAULT_HOPS: 1 }), ctx);
+    const res = await recallEntries({ query: "topic neighbor", topK: 5 }, env(db, { DEFAULT_HOPS: 1 }), ctx);
     expect(res.matches.map(m => m.id)).toContain("neighbor");
   });
 
   it("returns direct matches only under the shipped default", async () => {
-    const res = await recallEntries({ query: "topic", topK: 5 }, env(db), ctx);
+    const res = await recallEntries({ query: "topic neighbor", topK: 5 }, env(db), ctx);
     expect(res.matches.map(m => m.id)).not.toContain("neighbor");
   });
 
   // The property that protects MCP clients: an explicit request wins over the
   // stored preference, including an explicit 0.
   it("lets an explicit hops:0 from the caller override a raised default", async () => {
-    const res = await recallEntries({ query: "topic", topK: 5, hops: 0 }, env(db, { DEFAULT_HOPS: 2 }), ctx);
+    const res = await recallEntries({ query: "topic neighbor", topK: 5, hops: 0 }, env(db, { DEFAULT_HOPS: 2 }), ctx);
     expect(res.matches.map(m => m.id)).not.toContain("neighbor");
   });
 
   it("lets an explicit hops:1 win when the default is 0", async () => {
-    const res = await recallEntries({ query: "topic", topK: 5, hops: 1 }, env(db), ctx);
+    const res = await recallEntries({ query: "topic neighbor", topK: 5, hops: 1 }, env(db), ctx);
     expect(res.matches.map(m => m.id)).toContain("neighbor");
   });
 
@@ -99,7 +99,7 @@ describe("DEFAULT_HOPS (#246 connections control)", () => {
     // removed together, and it does go red then.
     seed(db, "h1");
     seed(db, "h2");
-    seed(db, "h3", "topic h3");
+    seed(db, "h3", "topic neighbor h3");
     seed(db, "h4", "topic h4");
     edge(db, "seed", "h1");
     edge(db, "h1", "h2");
@@ -107,7 +107,7 @@ describe("DEFAULT_HOPS (#246 connections control)", () => {
     edge(db, "h3", "h4");
 
     // topK is generous so the assertion is about traversal depth, not truncation.
-    const res = await recallEntries({ query: "topic", topK: 50 }, env(db, { DEFAULT_HOPS: 99 }), ctx);
+    const res = await recallEntries({ query: "topic neighbor", topK: 50 }, env(db, { DEFAULT_HOPS: 99 }), ctx);
     const ids = res.matches.map(m => m.id);
 
     expect(ids).toContain("h3");

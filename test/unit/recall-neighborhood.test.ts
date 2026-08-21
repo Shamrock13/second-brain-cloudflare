@@ -137,6 +137,25 @@ describe("deterministic linked-evidence scoring", () => {
     expect(score.rejection).toBe("weak-neighborhood");
   });
 
+  it("rejects a favorable one-token substring-only neighborhood", () => {
+    const score = scoreLinkedEvidence({
+      ...base,
+      parentScore: 1,
+      parentContent: "",
+      content: "platforms",
+      queryTokens: ["platform"],
+      corpus: { df: new Map([["platform", 90]]), total: 100 },
+      hop: 0,
+      hopDecay: 1,
+      edgeWeight: 1,
+      intent: "causal",
+      edgeType: "decided",
+    });
+
+    expect(score.eligible).toBe(false);
+    expect(score.rejection).toBe("weak-neighborhood");
+  });
+
   const qualifying = {
     ...base,
     parentContent: "The backend direction changed",
