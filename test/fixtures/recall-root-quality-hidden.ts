@@ -21,13 +21,13 @@ interface HiddenGeometry {
   readonly recall: readonly number[];
 }
 
-interface HiddenTopologyRow {
-  readonly 0: string;
-  readonly 1: string;
-  readonly 2: EdgeFixture["type"];
-  readonly 3: number;
-  readonly 4: EdgeFixture["provenance"];
-}
+type HiddenTopologyRow = readonly [
+  string,
+  string,
+  EdgeFixture["type"],
+  number,
+  EdgeFixture["provenance"],
+];
 
 interface HiddenCaseManifest {
   readonly id: string;
@@ -1013,4 +1013,3 @@ export const HIDDEN_VALIDATION_CASES: readonly RootQualityCase[] =
 
 deepFreeze(HIDDEN_VALIDATION_MANIFEST);
 deepFreeze(HIDDEN_VALIDATION_CASES);
-
