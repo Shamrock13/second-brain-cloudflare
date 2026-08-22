@@ -109,6 +109,67 @@ describe("recall root selection", () => {
     expect(result.matches.map(x => x.id)).not.toContain("unrelated-neighbor");
   });
 
+  it("uses one omitted strong root only for the fifth slot", async () => {
+    const db = new D1Mock();
+    for (let i = 0; i < 4; i++) seed(db, `direct-${i}`, `quartz ledger protocol result ${i}`);
+    seed(db, "weak-fifth", "quartz archive note");
+    seed(db, "strong-root", "quartz ledger protocol decision record", ["status:canonical"]);
+    const prepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+      ? { bind: () => ({ all: async () => ({ results: [] }) }) }
+      : prepare(sql);
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
+      ...Array.from({ length: 4 }, (_, i) => ({ id: `direct-${i}`, score: .95 - i * .01, metadata: { parentId: `direct-${i}` } })),
+      { id: "weak-fifth", score: .8, metadata: { parentId: "weak-fifth" } },
+      { id: "strong-root", score: .4, metadata: { parentId: "strong-root" } },
+    ] }) }) });
+
+    const result = await recallEntries({
+      query: "quartz ledger protocol",
+      topK: 5,
+      hops: 1,
+      synthesize: false,
+    }, env, ctx);
+
+    expect(result.matches.map(match => match.id)).toEqual([
+      "direct-0", "direct-1", "direct-2", "direct-3", "strong-root",
+    ]);
+  });
+
+  it("recovers a supplemental-anchor candidate without reordering the direct top four", async () => {
+    const db = new D1Mock();
+    for (let i = 0; i < 5; i++) seed(db, `direct-${i}`, `ledger note ${i}`);
+    seed(db, "anchor-root", "quartz protocol compass decision record", ["status:canonical"]);
+    const prepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => {
+      if (sql.includes("AS total") && sql.includes("SUM(CASE WHEN content LIKE")) {
+        return { bind: () => ({ first: async () => ({ total: 100, d0: 90, d1: 15, d2: 80, d3: 85 }) }) };
+      }
+      if (sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")) {
+        const row = db.entries.find(entry => entry.id === "anchor-root")!;
+        return { bind: () => ({ all: async () => ({ results: [row] }) }) };
+      }
+      return prepare(sql);
+    };
+    const diagnostics: RecallDiagnostics = {};
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [
+      ...Array.from({ length: 5 }, (_, i) => ({ id: `direct-${i}`, score: .95 - i * .01, metadata: { parentId: `direct-${i}` } })),
+    ] }) }) });
+
+    const result = await recallEntries({
+      query: "quartz ledger protocol compass",
+      topK: 5,
+      hops: 1,
+      synthesize: false,
+    }, env, ctx, undefined, { diagnostics });
+
+    expect(diagnostics.keywordIds).toContain("anchor-root");
+    expect(diagnostics.fusedIds).toContain("anchor-root");
+    expect(result.matches.map(match => match.id)).toEqual([
+      "direct-0", "direct-1", "direct-2", "direct-3", "anchor-root",
+    ]);
+  });
+
   it("does not populate root-selection diagnostics at hops:0", async () => {
     const db = new D1Mock();
     seed(db, "direct", "direct status", ["work"]);

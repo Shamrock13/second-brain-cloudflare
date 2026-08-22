@@ -12,7 +12,38 @@ export interface QueryProfile {
   lexicalQuery: string;
   lexicalTokens: string[];
   evidenceTokens: string[];
+  retrievalTokens: string[];
   intent: RecallIntent;
+}
+
+function identifierShaped(token: string): boolean {
+  return /[\d#.]/.test(token) || token.includes("-");
+}
+
+export function buildRetrievalTokens(
+  semanticQuery: string,
+  distilled: DistilledQuery,
+): string[] {
+  const evidence = tokenizeQuery(semanticQuery).slice(0, KEYWORD_MAX_TOKENS);
+  const position = new Map(evidence.map((token, index) => [token, index]));
+  const distilledTokens = tokenizeQuery(distilled.query);
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const append = (token: string) => {
+    if (ordered.length >= KEYWORD_MAX_TOKENS || seen.has(token)) return;
+    seen.add(token);
+    ordered.push(token);
+  };
+
+  distilledTokens.forEach(append);
+  evidence.filter(identifierShaped).forEach(append);
+  evidence
+    .filter(token => distilled.df?.has(token))
+    .sort((a, b) => (distilled.df!.get(a)! - distilled.df!.get(b)!)
+      || ((position.get(a) ?? 0) - (position.get(b) ?? 0)))
+    .forEach(append);
+  evidence.forEach(append);
+  return ordered;
 }
 
 const WORD = (items: string[]) => new RegExp(`(?<![\\w-])(?:${items.join("|")})(?![\\w-])`, "i");
@@ -29,11 +60,13 @@ export function buildQueryProfile(semanticQuery: string, distilled: DistilledQue
       : CURRENT.test(clean)
         ? "current"
         : "direct";
+  const evidenceTokens = tokenizeQuery(clean).slice(0, KEYWORD_MAX_TOKENS);
   return {
     semanticQuery: clean,
     lexicalQuery: distilled.query,
     lexicalTokens: tokenizeQuery(distilled.query),
-    evidenceTokens: tokenizeQuery(clean).slice(0, KEYWORD_MAX_TOKENS),
+    evidenceTokens,
+    retrievalTokens: buildRetrievalTokens(clean, distilled),
     intent,
   };
 }

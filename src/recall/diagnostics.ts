@@ -1,4 +1,3 @@
-import { EMBEDDING_MODEL } from "../constants";
 import type { Env } from "../env";
 import type { RecallDiagnostics, RecallOperationDiagnostics } from "./types";
 
@@ -105,9 +104,11 @@ export function observeRecallEnv(env: Env, diagnostics: RecallDiagnostics): Env 
   return {
     ...env,
     AI: observeMethods(env.AI, {
-      run: (model: unknown) => {
+      run: (_model: unknown, input: unknown) => {
         operations.aiCalls += 1;
-        if (model === EMBEDDING_MODEL) operations.embeddingCalls += 1;
+        if (input && typeof input === "object" && Array.isArray((input as { text?: unknown }).text)) {
+          operations.embeddingCalls += 1;
+        }
       },
     }),
     VECTORIZE: observeMethods(env.VECTORIZE, {

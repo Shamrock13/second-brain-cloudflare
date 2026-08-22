@@ -12,13 +12,13 @@ import type { GraphNeighbor } from "../graph/types";
 import { KIND_VALUES, type MemoryKind } from "../memory/kind";
 import { parseTimePhrase } from "../text/temporal";
 import { tokenizeQuery } from "../text/tokenize";
-import { distillToRareTerms, inferQueryTags, type DistilledQuery } from "./distill";
+import { distillToRareTerms, inferQueryTags, type DistilledQuery, type TimeBounds } from "./distill";
 import { synthesizeInsight } from "./insight";
 import { hasStaleAsOf } from "../memory/stale";
 import { cosineSim, mmrRerank, rerankWithTimeDecay, type VectorizeMatch } from "./math";
 import { rrfFuse } from "./rrf";
 import { computeCompoundStale } from "./compound-stale";
-import { graphSeedLimit, relatedSlotLimit, scoreLinkedEvidence } from "./neighborhood";
+import { exactQueryMatchCount, graphSeedLimit, relatedSlotLimit, scoreLinkedEvidence } from "./neighborhood";
 import { queryCoverage } from "./neighborhood";
 import { buildQueryProfile, DEFAULT_EMBEDDING_QUERY_MODE, embeddingInput } from "./query-profile";
 import { localEvidenceOf } from "./root-candidate";
@@ -26,8 +26,15 @@ import { selectGraphRoots, type RootCandidate } from "./root-selector";
 import type { KeywordRow, RecallInternalOptions, RecallMatch, RecallSearchResult } from "./types";
 import { TAG_LIKE_ESCAPE, tagLikePattern } from "../memory/tag-sql";
 import { observeRecallEnv } from "./diagnostics";
+import { chooseEvidenceSlot, type EvidenceSlotCandidate } from "./evidence-rescue";
+import { queryRelevantWindow } from "./snippet";
 
-async function keywordSearch(tokens: string[], env: Env, limit: number): Promise<KeywordRow[]> {
+async function keywordSearch(
+  tokens: string[],
+  env: Env,
+  limit: number,
+  bounds: Readonly<TimeBounds> = {},
+): Promise<KeywordRow[]> {
   if (!tokens.length) return [];
   // Capped here rather than at distillation's uncapped exits because this is
   // the only place a token count becomes SQL, and there are two such exits —
@@ -36,9 +43,20 @@ async function keywordSearch(tokens: string[], env: Env, limit: number): Promise
   // paths where the frequencies that would rank the terms are missing.
   const terms = tokens.slice(0, KEYWORD_MAX_TOKENS);
   const where = terms.map(() => "content LIKE ?").join(" OR ");
+  let timeWhere = "";
+  const timeBindings: number[] = [];
+  if (bounds.after !== undefined) {
+    timeWhere += " AND created_at >= ?";
+    timeBindings.push(bounds.after);
+  }
+  if (bounds.before !== undefined) {
+    timeWhere += " AND created_at < ?";
+    timeBindings.push(bounds.before);
+  }
+  const tokenWhere = timeWhere ? `(${where})` : where;
   const { results } = await env.DB.prepare(
-    `SELECT id, content, tags, source, created_at FROM entries WHERE ${where} ORDER BY created_at DESC LIMIT ?`
-  ).bind(...terms.map(t => `%${t}%`), limit).all();
+    `SELECT id, content, tags, source, created_at FROM entries WHERE ${tokenWhere}${timeWhere} ORDER BY created_at DESC LIMIT ?`
+  ).bind(...terms.map(t => `%${t}%`), ...timeBindings, limit).all();
   return results as unknown as KeywordRow[];
 }
 
@@ -134,7 +152,8 @@ export async function recallEntries(
     before = parsed.before;
     semanticQuery = parsed.cleanQuery;
   }
-  const distilled = await distillToRareTerms(semanticQuery, env, cfg);
+  const bounds = { after, before };
+  const distilled = await distillToRareTerms(semanticQuery, env, cfg, bounds);
   const profile = buildQueryProfile(semanticQuery, distilled);
   const embeddingQueryMode = internal.embeddingQueryMode ?? DEFAULT_EMBEDDING_QUERY_MODE;
   const embedQuery = embeddingInput(profile, embeddingQueryMode);
@@ -194,7 +213,10 @@ export async function recallEntries(
         return { matches: [] as VectorizeMatch[] };
       }
     };
-    const [denseResults, kwRows] = await Promise.all([denseQuery(), keywordSearch(tokens, env, cfg.KEYWORD_CANDIDATE_LIMIT)]);
+    const [denseResults, kwRows] = await Promise.all([
+      denseQuery(),
+      keywordSearch(profile.retrievalTokens, env, cfg.KEYWORD_CANDIDATE_LIMIT, bounds),
+    ]);
     results = denseResults;
     keywordRows = kwRows;
 
@@ -215,11 +237,13 @@ export async function recallEntries(
     internal.diagnostics.keywordIds = [...new Set(keywordRows.map(row => row.id))];
   }
 
-  const fusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag || semanticUnavailable, distilled, cfg.SUBSTRING_MATCH_WEIGHT);
-  if (!fusedMatches.length) return { matches: [], insight: "", semanticUnavailable };
+  const rootFusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, profile.retrievalTokens, !tag || semanticUnavailable, distilled, cfg.SUBSTRING_MATCH_WEIGHT);
+  const lexicalFusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag || semanticUnavailable, distilled, cfg.SUBSTRING_MATCH_WEIGHT);
+  const fusedMatches = lexicalFusedMatches.length ? lexicalFusedMatches : rootFusedMatches;
+  if (!rootFusedMatches.length && !fusedMatches.length) return { matches: [], insight: "", semanticUnavailable };
 
-  const candidateIds = [...new Set(fusedMatches.map(m => (m.metadata as any)?.parentId ?? m.id))] as string[];
-  internal.diagnostics && (internal.diagnostics.fusedIds = candidateIds);
+  const candidateIds = [...new Set([...fusedMatches, ...rootFusedMatches].map(m => (m.metadata as any)?.parentId ?? m.id))] as string[];
+  internal.diagnostics && (internal.diagnostics.fusedIds = [...new Set(rootFusedMatches.map(m => (m.metadata as any)?.parentId ?? m.id))] as string[]);
   type CandidateSignalRow = { id: string; content?: string; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number; tags: string };
   const rcRows: CandidateSignalRow[] = [];
   const candidateSignalProjection = hops > 0
@@ -255,11 +279,12 @@ export async function recallEntries(
 
   const directParentIds = directCandidates.map((m) => (m.metadata as any)?.parentId ?? m.id);
   let selectedRoots: ReturnType<typeof selectGraphRoots> = [];
+  let rootCandidates: RootCandidate[] = [];
   if (hops > 0) {
     const candidateContent = new Map(rcRows.map(r => [r.id, r.content ?? ""]));
-    const rootReranked = rerankWithTimeDecay(fusedMatches, recallCounts, importanceScores, queryTags, contradictionWins, contradictionLosses, d1Tags, cfg, { useRecallFrequency: false });
+    const rootReranked = rerankWithTimeDecay(rootFusedMatches, recallCounts, importanceScores, queryTags, contradictionWins, contradictionLosses, d1Tags, cfg, { useRecallFrequency: false });
     const rootSeen = new Set<string>();
-    const rootCandidates: RootCandidate[] = rootReranked.flatMap(match => {
+    rootCandidates = rootReranked.flatMap(match => {
       const parentId = ((match.metadata as any)?.parentId ?? match.id) as string;
       if (rootSeen.has(parentId)) return [];
       rootSeen.add(parentId);
@@ -305,7 +330,7 @@ export async function recallEntries(
     d1Filters += ` AND tags LIKE '%"kind:${kind}"%'`;
   }
   if (after !== undefined) { d1Filters += ` AND created_at >= ?`; filterBindings.push(after); }
-  if (before !== undefined) { d1Filters += ` AND created_at <= ?`; filterBindings.push(before); }
+  if (before !== undefined) { d1Filters += ` AND created_at < ?`; filterBindings.push(before); }
   const d1Rows: Record<string, any>[] = [];
   const idBatchSize = D1_MAX_BOUND_PARAMS - filterBindings.length;
   for (let i = 0; i < allParentIds.length; i += idBatchSize) {
@@ -352,7 +377,7 @@ export async function recallEntries(
     queryCoverage(replacement.content, tokens, distilled).score,
     queryCoverage(replacement.content, profile.evidenceTokens, distilled).score,
   ) : 0;
-  const expandedMatches: { match: RecallMatch; eligible: boolean }[] = expanded.flatMap((e) => {
+  const expandedMatches: { match: RecallMatch; eligible: boolean; evidenceText: string; coverage: number }[] = expanded.flatMap((e) => {
     const row = d1Map.get(e.id);
     if (!row) return [];
     const root = rootById.get(rootIdByNode.get(e.id) ?? "");
@@ -373,8 +398,16 @@ export async function recallEntries(
       edgeType: e.viaType,
     });
     if (!evidence.eligible) internal.diagnostics?.rejections?.push({ id: e.id, reason: evidence.rejection ?? "weak-neighborhood" });
+    const linkedEvidence = queryRelevantWindow(
+      row.content as string,
+      [...tokens, ...profile.evidenceTokens],
+    );
+    const evidenceText = `${root?.localEvidence ?? ""}\n${linkedEvidence}`;
+    const coverage = queryCoverage(evidenceText, profile.evidenceTokens, distilled).score;
     return [{
       eligible: evidence.eligible,
+      evidenceText,
+      coverage,
       match: {
         id: e.id,
         content: row.content as string,
@@ -405,12 +438,76 @@ export async function recallEntries(
     .filter(e => e.eligible && !directParentIds.includes(e.match.id))
     .slice(0, relatedLimit)
     .map(e => e.match);
-  if (internal.diagnostics) internal.diagnostics.selectedRelatedIds = selectedRelated.map(x => x.id);
   const selectedDirect = directMatches.slice(0, topK - selectedRelated.length);
-  const matches: RecallMatch[] = [...selectedDirect, ...selectedRelated];
+  const baselineMatches: RecallMatch[] = [...selectedDirect, ...selectedRelated];
+  let matches = baselineMatches;
+  if (hops > 0 && topK >= 5 && baselineMatches.length >= 5) {
+    const replacementIndex = baselineMatches.length - 1;
+    const replacementMatch = baselineMatches[replacementIndex];
+    const replacementEvidence = queryCoverage(
+      replacementMatch.content,
+      profile.evidenceTokens,
+      distilled,
+    ).score;
+    const protectedIds = new Set(baselineMatches.slice(0, replacementIndex).map(match => match.id));
+    const matchById = new Map<string, RecallMatch>();
+    const candidates: EvidenceSlotCandidate[] = [];
+
+    for (const selection of selectedRoots) {
+      const root = selection.candidate;
+      if (directParentIds.includes(root.parentId) || protectedIds.has(root.parentId)) continue;
+      const row = d1Map.get(root.parentId);
+      if (!row) continue;
+      const supplemental = queryCoverage(root.localEvidence, profile.evidenceTokens, distilled);
+      const match: RecallMatch = {
+        id: root.parentId,
+        content: row.content as string,
+        score: root.rootScore,
+        createdAt: row.created_at as number,
+        updatedAt: (row.updated_at as number | null) ?? (row.created_at as number),
+        tags: JSON.parse(row.tags ?? "[]"),
+        source: row.source as string,
+        isUpdate: false,
+        hop: 0,
+        staleAsOf: hasStaleAsOf(JSON.parse(row.tags ?? "[]")),
+      };
+      matchById.set(match.id, match);
+      candidates.push({
+        id: match.id,
+        coverage: supplemental.score,
+        exactHighIdf: supplemental.exactHighIdf,
+        exactMatchCount: exactQueryMatchCount(root.localEvidence, profile.evidenceTokens),
+        metadataAlignment: root.metadataAlignment,
+        score: root.rootScore,
+        source: "omitted-root",
+      });
+    }
+
+    for (const entry of sortedExpanded) {
+      if (!entry.eligible || protectedIds.has(entry.match.id) || directParentIds.includes(entry.match.id)) continue;
+      const precision = queryCoverage(entry.evidenceText, profile.evidenceTokens, distilled);
+      matchById.set(entry.match.id, entry.match);
+      candidates.push({
+        id: entry.match.id,
+        coverage: entry.coverage,
+        exactHighIdf: precision.exactHighIdf,
+        exactMatchCount: exactQueryMatchCount(entry.evidenceText, profile.evidenceTokens),
+        metadataAlignment: 0,
+        score: entry.match.score,
+        source: "related",
+      });
+    }
+
+    const chosen = chooseEvidenceSlot(replacementEvidence, candidates);
+    const chosenMatch = chosen && matchById.get(chosen.id);
+    if (chosenMatch) matches = [...baselineMatches.slice(0, replacementIndex), chosenMatch];
+  }
+  const finalDirectIds = new Set(matches.filter(match => match.hop === 0).map(match => match.id));
+  const finalRelated = matches.filter(match => match.hop > 0);
+  if (internal.diagnostics) internal.diagnostics.selectedRelatedIds = finalRelated.map(x => x.id);
   if (internal.diagnostics) internal.diagnostics.finalIds = matches.map(match => match.id);
 
-  const presentedDirectIds = new Set(selectedDirect.map(m => m.id));
+  const presentedDirectIds = finalDirectIds;
   ctx.waitUntil(
     Promise.all(
       [...presentedDirectIds].map(id =>

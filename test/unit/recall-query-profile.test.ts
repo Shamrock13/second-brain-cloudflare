@@ -9,24 +9,24 @@ describe("recall query profile", () => {
   it.each([
     ["why did the backend change", "causal"],
     ["what happened before the launch", "chronology"],
-    ["what is the current platform direction", "current"],
-    ["enterprise platform architecture", "direct"],
+    ["what is the current archive direction", "current"],
+    ["quartz archive architecture", "direct"],
   ] as const)("classifies %s", (query, intent) => {
     expect(buildQueryProfile(query, { query: "backend platform", df: null, total: null }).intent).toBe(intent);
   });
 
   it("keeps semantic and lexical representations separate", () => {
     const profile = buildQueryProfile(
-      "why did we change the enterprise backend direction",
-      { query: "enterprise backend", df: null, total: null },
+      "why did we change the quartz ledger direction",
+      { query: "quartz ledger", df: null, total: null },
     );
-    expect(profile.semanticQuery).toBe("why did we change the enterprise backend direction");
-    expect(profile.lexicalQuery).toBe("enterprise backend");
-    expect(profile.evidenceTokens).toEqual(["change", "enterprise", "backend", "direction"]);
-    expect(embeddingInput(profile, "distilled")).toBe("enterprise backend");
+    expect(profile.semanticQuery).toBe("why did we change the quartz ledger direction");
+    expect(profile.lexicalQuery).toBe("quartz ledger");
+    expect(profile.evidenceTokens).toEqual(["change", "quartz", "ledger", "direction"]);
+    expect(embeddingInput(profile, "distilled")).toBe("quartz ledger");
     expect(embeddingInput(profile, "semantic")).toBe(profile.semanticQuery);
     expect(embeddingInput(profile, "hybrid")).toBe(
-      "why did we change the enterprise backend direction enterprise backend",
+      "why did we change the quartz ledger direction quartz ledger",
     );
   });
 
@@ -35,6 +35,27 @@ describe("recall query profile", () => {
 
     expect(buildQueryProfile(query, { query: "signal19 signal18 signal17", df: null, total: null }).evidenceTokens)
       .toEqual(Array.from({ length: 16 }, (_, index) => `signal${index}`));
+  });
+
+  it("keeps distilled terms first and adds rarer full-query anchors", () => {
+    const df = new Map([
+      ["quartz", 90], ["ledger", 4], ["support", 8], ["protocol", 12],
+    ]);
+    const profile = buildQueryProfile(
+      "why did the quartz ledger change for support protocol",
+      { query: "ledger", df, total: 100 },
+    );
+
+    expect(profile.retrievalTokens).toEqual(["ledger", "support", "protocol", "quartz", "change"]);
+  });
+
+  it("preserves identifier-shaped anchors within the existing token cap", () => {
+    const query = "why issue #311 changed v2.3.2 "
+      + Array.from({ length: 30 }, (_, index) => `signal${index}`).join(" ");
+    const tokens = buildQueryProfile(query, { query: "changed", df: null, total: null }).retrievalTokens;
+
+    expect(tokens).toEqual(expect.arrayContaining(["#311", "v2.3.2"]));
+    expect(tokens).toHaveLength(16);
   });
 
   it("uses edge types as soft intent compatibility", () => {

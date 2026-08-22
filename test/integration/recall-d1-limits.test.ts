@@ -77,7 +77,7 @@ function withD1Limits(
 const exprDepth = (sql: string) => sql.split(/\s+OR\s+/i).length + 1;
 
 const keywordStatements = (executed: Executed[]) =>
-  executed.filter(e => e.sql.includes("FROM entries WHERE content LIKE"));
+  executed.filter(e => /FROM entries WHERE \(?content LIKE/.test(e.sql));
 
 const hydrationStatements = (executed: Executed[]) =>
   executed.filter(e => e.sql.includes("created_at, updated_at FROM entries WHERE id IN"));
@@ -104,6 +104,30 @@ describe("recall stays inside D1's statement limits", () => {
     });
 
   describe("the keyword clause, on an empty brain (#276)", () => {
+    it("scopes both existing candidate reads to one explicit date", async () => {
+      const day = new Date(2026, 7, 17).getTime();
+      sqlite.seed({ id: "in-range", content: "quartz ledger record", createdAt: day + 1 });
+      sqlite.seed({ id: "out-of-range", content: "quartz ledger record", createdAt: day + 86400000 + 1 });
+      const env = envWith(undefined, {
+        VECTORIZE: makeVectorizeMock({ query: vi.fn().mockRejectedValue(new Error("index unavailable")) }),
+      });
+
+      const result = await recallEntries({
+        query: "quartz ledger on August 17",
+        topK: 5,
+        hops: 0,
+        synthesize: false,
+      }, env, ctx);
+
+      expect(result.matches.map(match => match.id)).toEqual(["in-range"]);
+      const frequency = executed.find(entry => entry.sql.includes("SUM(CASE WHEN content LIKE"));
+      const keyword = keywordStatements(executed)[0];
+      expect(frequency?.sql).toContain("WHERE created_at >= ? AND created_at < ?");
+      expect(keyword.sql).toContain("AND created_at >= ? AND created_at < ?");
+      expect(frequency?.params.slice(-2)).toEqual([day, day + 86400000]);
+      expect(keyword.params.slice(-3, -1)).toEqual([day, day + 86400000]);
+    });
+
     it("answers a 120-word query with no memories stored", async () => {
       const res = await worker.fetch(
         req("GET", `/recall?query=${encodeURIComponent(LONG_QUERY)}`),
@@ -156,9 +180,10 @@ describe("recall stays inside D1's statement limits", () => {
         ctx,
       );
       expect(long.status).toBe(200);
-      // Distillation can rank terms again, so the keyword arm sees three of them
-      // plus the row limit — the cap is a backstop, not the narrowing.
-      expect(keywordStatements(executed)[0].params.length).toBe(4);
+      // Distillation still puts its three rarest terms first, while bounded
+      // retrieval anchors use the remainder of the existing 16-token budget.
+      // The final parameter remains the row limit.
+      expect(keywordStatements(executed)[0].params.length).toBe(17);
 
       executed.length = 0;
       const short = await worker.fetch(req("GET", "/recall?query=topic0"), env, ctx);

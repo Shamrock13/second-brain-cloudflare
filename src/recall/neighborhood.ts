@@ -94,7 +94,7 @@ export function queryCoverage(
 
 const clamp = (value: number) => Math.max(0, Math.min(1, value));
 
-function exactBoundaryMatchCount(content: string, tokens: string[]): number {
+export function exactQueryMatchCount(content: string, tokens: string[]): number {
   const lower = content.toLowerCase();
   return [...new Set(tokens.map(token => token.toLowerCase()).filter(Boolean))]
     .filter(token => new RegExp(`(?<![\\w])${escapeRegExp(token)}(?![\\w])`).test(lower)).length;
@@ -144,7 +144,7 @@ export function scoreLinkedEvidence(input: LinkedEvidenceInput): NeighborhoodEvi
     + WEIGHT.provenance * provenanceFactor
     + WEIGHT.intent * edgeIntentCompatibility(input.intent, input.edgeType),
   );
-  const meetsPrecisionGate = precision.exactHighIdf || exactBoundaryMatchCount(linkedEvidence, input.queryTokens) >= 2;
+  const meetsPrecisionGate = precision.exactHighIdf || exactQueryMatchCount(linkedEvidence, input.queryTokens) >= 2;
   const meetsLinkedEvidenceGate = (linkedCoverage >= MIN_LINKED_COVERAGE || precision.exactHighIdf)
     && meetsPrecisionGate;
   if (!meetsLinkedEvidenceGate || score < MIN_NEIGHBORHOOD_SCORE) {
