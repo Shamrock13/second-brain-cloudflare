@@ -147,7 +147,13 @@ describe("recall root selection", () => {
       }
       if (sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")) {
         const row = db.entries.find(entry => entry.id === "anchor-root")!;
-        return { bind: () => ({ all: async () => ({ results: [row] }) }) };
+        return { bind: (...bindings: unknown[]) => ({
+          all: async () => ({
+            results: bindings.some(value => ["%quartz%", "%protocol%", "%compass%"].includes(String(value)))
+              ? [row]
+              : [],
+          }),
+        }) };
       }
       return prepare(sql);
     };
