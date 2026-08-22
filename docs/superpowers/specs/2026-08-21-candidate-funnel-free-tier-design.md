@@ -5,6 +5,16 @@
 **Date:** 2026-08-21  
 **Status:** Approved by Rahil in chat
 
+## Dataset-independence release requirement
+
+The template serves independently populated brains, so the implementation must
+be corpus-agnostic. Production code and committed tests may not contain or key
+off personal memory IDs, names, facts, benchmark wording, topic vocabularies,
+or thresholds fitted to the live validation corpus. Tests use fictional,
+synthetic memories and assert relative evidence properties and fixed resource
+invariants. The personal deployment is an external validation corpus only; its
+contents and diagnostic report remain untracked.
+
 ## Goal
 
 Turn the six observable live candidate/root-availability misses into measurable
@@ -271,6 +281,30 @@ and statement count remain compatible except for retrieval-token contents.
 - Public HTTP/MCP schemas and rendered provenance are unchanged.
 - Tag/kind/date filters remain hard eligibility filters.
 - Vectorize failure continues to degrade to keyword-only recall.
+
+### 7. Bounded evidence-rescue composition
+
+The live funnel diagnosis showed that some authoritative candidates were
+already present in the fused and reranked pools but were omitted from the final
+five. Final composition therefore gains one deterministic evidence slot. It
+reuses already hydrated candidates and already computed query coverage; it does
+not retrieve, expand, or synthesize anything new.
+
+- The first four direct results are immutable.
+- At most one omitted candidate may occupy the last result slot.
+- It must have strictly greater query-evidence coverage than the displaced
+  result and pass the same precision shape used by graph evidence: either an
+  exact high-IDF match or at least two exact query-token matches.
+- The candidate is selected by a stable, corpus-relative tuple: coverage,
+  exact-high-IDF, exact-match count, metadata alignment, existing root score,
+  then ID.
+- An eligible graph result and an omitted direct candidate compete for the same
+  bounded evidence slot on their query coverage; the stronger evidence wins.
+- The rule is active only when `hops > 0` and `topK >= 5`; result count, graph
+  caps, and direct top-four preservation remain unchanged.
+
+No absolute score threshold is introduced. This avoids fitting the rule to one
+brain's score distribution and adds no Cloudflare or neuron operation.
 
 ## Test strategy
 

@@ -22,6 +22,9 @@
 - The existing generic 20-case benchmark and sealed hidden regression remain frozen. Do not tune their fixtures, authoritative labels, thresholds, or digest.
 - Live scoring excludes benchmark-recap memories and uses exactly one `recall(topK:5, hops:1)` per frozen question.
 - No merge or push until Rahil reviews the final live benchmark.
+- Production logic and committed fixtures must be brain-agnostic. Do not use
+  personal memory IDs, names, facts, benchmark phrases, topic allowlists, or
+  corpus-fitted thresholds. Personal data is external validation only.
 
 ---
 
@@ -603,6 +606,31 @@ git add src/recall/search.ts test/integration/keyword-recall-quality.test.ts \
   test/integration/recall-root-quality-hidden-validation.test.ts
 git commit -m "feat: recover recall candidates within existing budgets"
 ```
+
+### Task 6A: Add the brain-agnostic evidence-rescue slot
+
+**Files:**
+- Create: `src/recall/evidence-rescue.ts`
+- Create: `test/unit/recall-evidence-rescue.test.ts`
+- Modify: `src/recall/search.ts`
+- Modify: `test/integration/recall-root-selection.test.ts`
+
+- [ ] Write synthetic failing tests proving that the first four direct IDs are
+  preserved, at most one omitted strong candidate replaces only the weakest
+  result, a common single-token match abstains, a stronger graph result keeps
+  the evidence slot, ties are deterministic, and `topK < 5` does not rescue.
+- [ ] Run the focused unit and integration tests and capture RED.
+- [ ] Implement a pure selector using relative query coverage, exact-high-IDF,
+  exact-match count, existing metadata alignment/root score, and stable ID
+  ordering. Add no model, binding, graph, output, or absolute threshold.
+- [ ] Integrate it after existing hydration so omitted root candidates and
+  eligible related candidates compete for the one final evidence slot.
+- [ ] Run focused tests GREEN and verify operation snapshots are byte-for-byte
+  unchanged.
+- [ ] Mutate the strict evidence-gain comparison and precision gate separately;
+  each synthetic sentinel must fail before restoring GREEN.
+- [ ] Scan the production/test diff for personal IDs, names, facts, benchmark
+  phrases, and topic-specific branches. Any match is blocking.
 
 ### Task 7: Full review, clean deployment, and live release gate
 
