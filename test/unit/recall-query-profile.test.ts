@@ -58,6 +58,28 @@ describe("recall query profile", () => {
     expect(tokens).toHaveLength(16);
   });
 
+  it("uses bounded deterministic variants without replacing original evidence", () => {
+    const tokens = buildQueryProfile(
+      "Did North Harbor teams review launch-plans on June 3?",
+      { query: "review", df: null, total: null },
+    ).retrievalTokens;
+
+    expect(tokens.slice(0, 6)).toEqual(["review", "launch-plans", "north", "harbor", "teams", "june"]);
+    expect(tokens).toEqual(expect.arrayContaining([
+      "launchplans", "launch", "plans", "nh", "june 3", "team", "plan",
+    ]));
+    expect(tokens.length).toBeLessThanOrEqual(16);
+  });
+
+  it("never lets variants displace the capped original token set", () => {
+    const query = Array.from({ length: 20 }, (_, index) => `records${index}`).join(" ");
+    const tokens = buildQueryProfile(query, { query: "records19", df: null, total: null }).retrievalTokens;
+
+    expect(tokens).toHaveLength(16);
+    expect(tokens[0]).toBe("records19");
+    expect(tokens).not.toContain("record19");
+  });
+
   it("uses edge types as soft intent compatibility", () => {
     expect(edgeIntentCompatibility("causal", "caused_by")).toBeGreaterThan(
       edgeIntentCompatibility("causal", "relates_to"),

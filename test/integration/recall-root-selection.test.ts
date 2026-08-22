@@ -66,6 +66,16 @@ describe("recall root selection", () => {
     expect(diagnostics.rejections).toContainEqual({ id: "weak", reason: "no-linked-evidence" });
     expect(diagnostics.finalIds).toEqual(observedResult.matches.map(x => x.id));
     expect(diagnostics.operations?.embeddingCalls).toBe(1);
+    expect(Object.keys(diagnostics.stageMs ?? {}).sort()).toEqual([
+      "candidateGeneration", "candidateHydration", "finalHydration", "graphExpansion",
+      "querySignals", "selection", "setup", "synthesis", "total",
+    ]);
+    expect(Object.values(diagnostics.stageMs ?? {}).every(value => value >= 0)).toBe(true);
+    expect(diagnostics.stageMs?.total).toBeGreaterThanOrEqual(
+      Math.max(...Object.entries(diagnostics.stageMs ?? {})
+        .filter(([stage]) => stage !== "total")
+        .map(([, value]) => value)),
+    );
 
     expect(observedResult.matches.map(x => x.id)).toEqual(ordinaryResult.matches.map(x => x.id));
     expect(observed.env.AI.run).toHaveBeenCalledTimes((ordinary.env.AI.run as ReturnType<typeof vi.fn>).mock.calls.length);
@@ -134,6 +144,84 @@ describe("recall root selection", () => {
     expect(result.matches.map(match => match.id)).toEqual([
       "direct-0", "direct-1", "direct-2", "direct-3", "strong-root",
     ]);
+  });
+
+  it("uses existing semantic rank to rescue a paraphrased root only into the fifth slot", async () => {
+    const db = new D1Mock();
+    seed(db, "semantic-root", "The migration rationale was operational resilience");
+    for (let i = 0; i < 5; i++) {
+      seed(db, `frequent-${i}`, `north harbor direction note ${i}`);
+      (db.entries.at(-1) as any).recall_count = 10_000;
+    }
+    const prepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+      ? { bind: () => ({ all: async () => ({ results: [] }) }) }
+      : prepare(sql);
+    const vectorQuery = vi.fn().mockResolvedValue({ matches: [
+      { id: "semantic-root", score: .96, metadata: { parentId: "semantic-root", created_at: 1000 } },
+      ...Array.from({ length: 5 }, (_, i) => ({
+        id: `frequent-${i}`,
+        score: .9 - i * .01,
+        metadata: { parentId: `frequent-${i}`, created_at: 1000 },
+      })),
+    ] });
+    const diagnostics: RecallDiagnostics = {};
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query: vectorQuery }) });
+
+    const result = await recallEntries({
+      query: "why did the north harbor direction change",
+      topK: 5,
+      hops: 1,
+      synthesize: false,
+    }, env, ctx, undefined, { diagnostics });
+
+    expect(result.matches.slice(0, 4).map(match => match.id)).toEqual([
+      "frequent-0", "frequent-1", "frequent-2", "frequent-3",
+    ]);
+    expect(result.matches[4].id).toBe("semantic-root");
+    expect(diagnostics.operations).toMatchObject({
+      embeddingCalls: 1,
+      vectorizeQueries: 1,
+      vectorizeGets: 0,
+    });
+  });
+
+  it("considers only the strongest omitted semantic root without expanding the graph budget", async () => {
+    const db = new D1Mock();
+    for (let i = 1; i <= 17; i++) {
+      const content = i === 16 ? "The resilience rationale favored a staged migration" : `unrelated archive note ${i}`;
+      seed(db, `candidate-${i}`, content, i >= 5 && i <= 15 ? ["status:deprecated"] : []);
+      if (i <= 4 || i === 17) (db.entries.at(-1) as any).recall_count = 10_000;
+    }
+    const prepare = db.prepare.bind(db);
+    (db as any).prepare = (sql: string) => sql.includes("WHERE content LIKE") && sql.includes("ORDER BY created_at DESC LIMIT")
+      ? { bind: () => ({ all: async () => ({ results: [] }) }) }
+      : prepare(sql);
+    const query = vi.fn().mockResolvedValue({ matches: Array.from({ length: 17 }, (_, index) => ({
+      id: `candidate-${index + 1}`,
+      score: .91 - index * .01,
+      metadata: { parentId: `candidate-${index + 1}`, created_at: 1000 },
+    })) });
+    const diagnostics: RecallDiagnostics = {};
+    const env = makeTestEnv(db, { VECTORIZE: makeVectorizeMock({ query }) });
+
+    const result = await recallEntries({
+      query: "why did the north harbor direction change",
+      topK: 5,
+      hops: 1,
+      synthesize: false,
+    }, env, ctx, undefined, { diagnostics });
+
+    expect(diagnostics.rootSelections).toHaveLength(15);
+    expect(diagnostics.rootSelections?.map(selection => selection.id)).not.toContain("candidate-16");
+    expect(result.matches.map(match => match.id)).toEqual([
+      "candidate-1", "candidate-2", "candidate-3", "candidate-4", "candidate-16",
+    ]);
+    expect(diagnostics.operations).toMatchObject({
+      embeddingCalls: 1,
+      vectorizeQueries: 1,
+      vectorizeGets: 0,
+    });
   });
 
   it("recovers a supplemental-anchor candidate without reordering the direct top four", async () => {

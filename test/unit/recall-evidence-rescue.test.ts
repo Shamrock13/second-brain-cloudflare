@@ -46,6 +46,34 @@ describe("brain-agnostic evidence slot", () => {
     })])?.id).toBe("rare");
   });
 
+  it("allows a semantically selected root that outranks the displaced result", () => {
+    expect(chooseEvidenceSlot({ coverage: 0.6, semanticRank: 8 }, [candidate("paraphrase", 0, {
+      exactMatchCount: 0,
+      semanticEligible: true,
+      semanticRank: 3,
+    })])?.id).toBe("paraphrase");
+  });
+
+  it("rejects semantic evidence that is weaker or was not independently selected", () => {
+    expect(chooseEvidenceSlot({ coverage: 0.6, semanticRank: 3 }, [candidate("weaker", 0, {
+      exactMatchCount: 0,
+      semanticEligible: true,
+      semanticRank: 4,
+    })])).toBeUndefined();
+    expect(chooseEvidenceSlot({ coverage: 0.6, semanticRank: 8 }, [candidate("unselected", 0, {
+      exactMatchCount: 0,
+      semanticRank: 2,
+    })])).toBeUndefined();
+  });
+
+  it("does not use semantic rescue to displace an accepted graph result", () => {
+    expect(chooseEvidenceSlot({ coverage: 0.2, semanticAllowed: false }, [candidate("paraphrase", 0, {
+      exactMatchCount: 0,
+      semanticEligible: true,
+      semanticRank: 1,
+    })])).toBeUndefined();
+  });
+
   it("lets stronger graph evidence keep the shared slot", () => {
     expect(chooseEvidenceSlot(0.2, [
       candidate("root", 0.7),

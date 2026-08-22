@@ -434,11 +434,17 @@ export class D1Mock {
         }
         if (s.includes("recall_count, importance_score") && s.includes("WHERE id IN")) {
           const includesContent = s.startsWith("SELECT id, content,");
+          const includesHydrationFields = s.startsWith("SELECT id, content, source, created_at, COALESCE(updated_at, created_at) AS last_updated,");
           const results = db.entries
             .filter((e: any) => args.includes(e.id))
             .map((e: any) => ({
               id: e.id,
               ...(includesContent ? { content: e.content } : {}),
+              ...(includesHydrationFields ? {
+                source: e.source,
+                created_at: e.created_at,
+                last_updated: e.updated_at ?? e.created_at,
+              } : {}),
               recall_count: e.recall_count ?? 0,
               importance_score: e.importance_score ?? 0,
               contradiction_wins: e.contradiction_wins ?? 0,

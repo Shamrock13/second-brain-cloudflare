@@ -23,7 +23,7 @@ import { queryCoverage } from "./neighborhood";
 import { buildQueryProfile, DEFAULT_EMBEDDING_QUERY_MODE, embeddingInput } from "./query-profile";
 import { localEvidenceOf } from "./root-candidate";
 import { selectGraphRoots, type RootCandidate } from "./root-selector";
-import type { KeywordRow, RecallInternalOptions, RecallMatch, RecallSearchResult } from "./types";
+import type { KeywordRow, RecallInternalOptions, RecallMatch, RecallSearchResult, RecallStage } from "./types";
 import { TAG_LIKE_ESCAPE, tagLikePattern } from "../memory/tag-sql";
 import { observeRecallEnv } from "./diagnostics";
 import { chooseEvidenceSlot, type EvidenceSlotCandidate } from "./evidence-rescue";
@@ -136,6 +136,15 @@ export async function recallEntries(
   config?: Readonly<Config>,
   internal: RecallInternalOptions = {},
 ): Promise<RecallSearchResult> {
+  const totalStartedAt = performance.now();
+  let stageStartedAt = totalStartedAt;
+  const markStage = (stage: RecallStage) => {
+    if (internal.diagnostics) {
+      internal.diagnostics.stageMs ??= {};
+      internal.diagnostics.stageMs[stage] = performance.now() - stageStartedAt;
+    }
+    stageStartedAt = performance.now();
+  };
   if (internal.diagnostics) env = observeRecallEnv(env, internal.diagnostics);
   const cfg = config ?? await resolveConfig(env);
   const { query, topK } = params;
@@ -159,12 +168,14 @@ export async function recallEntries(
   const embedQuery = embeddingInput(profile, embeddingQueryMode);
   const lexicalQuery = profile.lexicalQuery;
   internal.diagnostics && (internal.diagnostics.embeddingMode = embeddingQueryMode);
+  markStage("setup");
 
   const tokens = profile.lexicalTokens;
   const [values, queryTags] = await Promise.all([
     embed(embedQuery, env, cfg),
     inferQueryTags(lexicalQuery, env, cfg, ctx),
   ]);
+  markStage("querySignals");
 
   let keywordRows: KeywordRow[] = [];
   let results: { matches: VectorizeMatch[] };
@@ -236,6 +247,15 @@ export async function recallEntries(
     internal.diagnostics.denseIds = [...new Set(results.matches.map(m => ((m.metadata as any)?.parentId ?? m.id) as string))];
     internal.diagnostics.keywordIds = [...new Set(keywordRows.map(row => row.id))];
   }
+  markStage("candidateGeneration");
+
+  const semanticRankByParent = new Map<string, number>();
+  [...results.matches]
+    .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
+    .forEach(match => {
+      const parentId = ((match.metadata as any)?.parentId ?? match.id) as string;
+      if (!semanticRankByParent.has(parentId)) semanticRankByParent.set(parentId, semanticRankByParent.size + 1);
+    });
 
   const rootFusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, profile.retrievalTokens, !tag || semanticUnavailable, distilled, cfg.SUBSTRING_MATCH_WEIGHT);
   const lexicalFusedMatches = fuseDenseAndKeyword(results.matches as VectorizeMatch[], keywordRows, tokens, !tag || semanticUnavailable, distilled, cfg.SUBSTRING_MATCH_WEIGHT);
@@ -244,10 +264,10 @@ export async function recallEntries(
 
   const candidateIds = [...new Set([...fusedMatches, ...rootFusedMatches].map(m => (m.metadata as any)?.parentId ?? m.id))] as string[];
   internal.diagnostics && (internal.diagnostics.fusedIds = [...new Set(rootFusedMatches.map(m => (m.metadata as any)?.parentId ?? m.id))] as string[]);
-  type CandidateSignalRow = { id: string; content?: string; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number; tags: string };
+  type CandidateSignalRow = { id: string; content?: string; source?: string; created_at?: number; last_updated?: number; recall_count: number; importance_score: number; contradiction_wins: number; contradiction_losses: number; tags: string };
   const rcRows: CandidateSignalRow[] = [];
   const candidateSignalProjection = hops > 0
-    ? "id, content, recall_count, importance_score, contradiction_wins, contradiction_losses, tags"
+    ? `id, content, source, created_at, COALESCE(updated_at, created_at) AS last_updated, recall_count, importance_score, contradiction_wins, contradiction_losses, tags`
     : "id, recall_count, importance_score, contradiction_wins, contradiction_losses, tags";
   for (let i = 0; i < candidateIds.length; i += D1_MAX_BOUND_PARAMS) {
     const batch = candidateIds.slice(i, i + D1_MAX_BOUND_PARAMS);
@@ -274,6 +294,7 @@ export async function recallEntries(
     return true;
   });
   const directCandidates = mmrRerank(dedupedAll, cfg.MMR_LAMBDA, topK);
+  markStage("candidateHydration");
 
   if (!directCandidates.length) return { matches: [], insight: "", semanticUnavailable };
 
@@ -295,7 +316,8 @@ export async function recallEntries(
       const authorityAlignment = ["current", "direct"].includes(profile.intent) && tags.includes("status:canonical") ? 1 : 0;
       return [{ ...match, parentId, rootScore: match.score, localEvidence, tags,
         lexicalCoverage: queryCoverage(localEvidence, tokens, distilled).score,
-        metadataAlignment: Math.min(1, .6 * tagAlignment + .2 * episodicAlignment + .2 * authorityAlignment) }];
+        metadataAlignment: Math.min(1, .6 * tagAlignment + .2 * episodicAlignment + .2 * authorityAlignment),
+        semanticRank: semanticRankByParent.get(parentId) }];
     });
     selectedRoots = selectGraphRoots(rootCandidates, graphSeedLimit(topK, rootCandidates.length), cfg.MMR_LAMBDA);
   }
@@ -309,6 +331,7 @@ export async function recallEntries(
   if (hops > 0) {
     expanded = await expandGraph(graphSeedIds, { hops }, env, cfg);
   }
+  markStage("graphExpansion");
   if (internal.diagnostics && hops > 0) internal.diagnostics.expandedIds = expanded.map(x => x.id);
 
   // The graph view can include up to 50 roots and 50 expanded nodes in addition
@@ -343,6 +366,8 @@ export async function recallEntries(
   }
 
   const d1Map = new Map(d1Rows.map((r) => [r.id as string, r]));
+  const candidateSignalById = new Map(rcRows.map(row => [row.id, row]));
+  markStage("finalHydration");
 
   const directMatches: RecallMatch[] = directCandidates.flatMap((m) => {
     const meta = m.metadata as Record<string, any>;
@@ -453,23 +478,43 @@ export async function recallEntries(
     const matchById = new Map<string, RecallMatch>();
     const candidates: EvidenceSlotCandidate[] = [];
 
-    for (const selection of selectedRoots) {
-      const root = selection.candidate;
+    const selectedRootIds = new Set(selectedRoots.map(selection => selection.candidate.parentId));
+    const omittedChallenger = rootCandidates
+      .filter(root => !selectedRootIds.has(root.parentId) && !directParentIds.includes(root.parentId))
+      .filter(root => root.semanticRank !== undefined)
+      .sort((a, b) => a.semanticRank! - b.semanticRank!
+        || b.rootScore - a.rootScore
+        || a.parentId.localeCompare(b.parentId))[0];
+    const rootsForEvidence = [
+      ...selectedRoots.map(selection => ({ root: selection.candidate, semanticEligible: selection.selectedBy === "semantic" })),
+      ...(omittedChallenger ? [{ root: omittedChallenger, semanticEligible: true }] : []),
+    ];
+
+    for (const { root, semanticEligible } of rootsForEvidence) {
       if (directParentIds.includes(root.parentId) || protectedIds.has(root.parentId)) continue;
-      const row = d1Map.get(root.parentId);
+      const row = d1Map.get(root.parentId) ?? candidateSignalById.get(root.parentId);
       if (!row) continue;
+      const rowTags = JSON.parse(row.tags ?? "[]") as string[];
+      const normalizedRowTags = rowTags.map(value => value.toLowerCase());
+      if (normalizedRowTags.some(value => ["auto-pattern", "auto-insight", "status:deprecated"].includes(value))) continue;
+      if (tag && !normalizedRowTags.includes(tag.toLowerCase())) continue;
+      if (kind && !rowTags.includes(`kind:${kind}`)) continue;
+      if (after !== undefined && Number(row.created_at) < after) continue;
+      if (before !== undefined && Number(row.created_at) >= before) continue;
       const supplemental = queryCoverage(root.localEvidence, profile.evidenceTokens, distilled);
       const match: RecallMatch = {
         id: root.parentId,
         content: row.content as string,
         score: root.rootScore,
         createdAt: row.created_at as number,
-        updatedAt: (row.updated_at as number | null) ?? (row.created_at as number),
-        tags: JSON.parse(row.tags ?? "[]"),
+        updatedAt: "last_updated" in row
+          ? row.last_updated as number
+          : ((row as Record<string, any>).updated_at as number | null) ?? (row.created_at as number),
+        tags: rowTags,
         source: row.source as string,
         isUpdate: false,
         hop: 0,
-        staleAsOf: hasStaleAsOf(JSON.parse(row.tags ?? "[]")),
+        staleAsOf: hasStaleAsOf(rowTags),
       };
       matchById.set(match.id, match);
       candidates.push({
@@ -480,6 +525,8 @@ export async function recallEntries(
         metadataAlignment: root.metadataAlignment,
         score: root.rootScore,
         source: "omitted-root",
+        semanticRank: root.semanticRank,
+        semanticEligible,
       });
     }
 
@@ -498,7 +545,11 @@ export async function recallEntries(
       });
     }
 
-    const chosen = chooseEvidenceSlot(replacementEvidence, candidates);
+    const chosen = chooseEvidenceSlot({
+      coverage: replacementEvidence,
+      semanticRank: semanticRankByParent.get(replacementMatch.id),
+      semanticAllowed: replacementMatch.hop === 0,
+    }, candidates);
     const chosenMatch = chosen && matchById.get(chosen.id);
     if (chosenMatch) matches = [...baselineMatches.slice(0, replacementIndex), chosenMatch];
   }
@@ -506,6 +557,7 @@ export async function recallEntries(
   const finalRelated = matches.filter(match => match.hop > 0);
   if (internal.diagnostics) internal.diagnostics.selectedRelatedIds = finalRelated.map(x => x.id);
   if (internal.diagnostics) internal.diagnostics.finalIds = matches.map(match => match.id);
+  markStage("selection");
 
   const presentedDirectIds = finalDirectIds;
   ctx.waitUntil(
@@ -524,6 +576,12 @@ export async function recallEntries(
   const insight = synthesize && matches.length > 1
     ? await synthesizeInsight(lexicalQuery, matches.map(m => ({ id: m.id, content: m.content })), env, cfg)
     : "";
+
+  markStage("synthesis");
+  if (internal.diagnostics) {
+    internal.diagnostics.stageMs ??= {};
+    internal.diagnostics.stageMs.total = performance.now() - totalStartedAt;
+  }
 
   return { matches, insight, semanticUnavailable, queryUsed: lexicalQuery, queryTokens: tokens, compoundStale };
 }

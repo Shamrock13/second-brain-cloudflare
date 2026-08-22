@@ -9,6 +9,7 @@ export interface RootCandidate extends VectorizeMatch {
   tags: string[];
   lexicalCoverage: number;
   metadataAlignment: number;
+  semanticRank?: number;
 }
 
 export interface SelectedRoot {
