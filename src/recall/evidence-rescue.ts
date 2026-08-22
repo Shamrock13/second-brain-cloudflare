@@ -8,6 +8,14 @@ export interface EvidenceSlotCandidate {
   metadataAlignment: number;
   score: number;
   source: EvidenceSlotSource;
+  semanticRank?: number;
+  semanticEligible?: boolean;
+}
+
+export interface EvidenceSlotBaseline {
+  coverage: number;
+  semanticRank?: number;
+  semanticAllowed?: boolean;
 }
 
 const compareEvidence = (a: EvidenceSlotCandidate, b: EvidenceSlotCandidate) =>
@@ -24,12 +32,21 @@ const compareEvidence = (a: EvidenceSlotCandidate, b: EvidenceSlotCandidate) =>
  * displace, so it is independent of any brain's score distribution.
  */
 export function chooseEvidenceSlot(
-  replacementCoverage: number,
+  replacement: number | EvidenceSlotBaseline,
   candidates: readonly EvidenceSlotCandidate[],
 ): EvidenceSlotCandidate | undefined {
+  const baseline = typeof replacement === "number" ? { coverage: replacement } : replacement;
   return candidates
-    .filter(candidate => candidate.coverage > replacementCoverage)
-    .filter(candidate => candidate.exactHighIdf || candidate.exactMatchCount >= 2)
+    .filter(candidate => {
+      const lexicalGain = candidate.coverage > baseline.coverage
+        && (candidate.exactHighIdf || candidate.exactMatchCount >= 2);
+      const semanticGain = candidate.source === "omitted-root"
+        && baseline.semanticAllowed !== false
+        && candidate.semanticEligible === true
+        && candidate.semanticRank !== undefined
+        && (baseline.semanticRank === undefined || candidate.semanticRank < baseline.semanticRank);
+      return lexicalGain || semanticGain;
+    })
     .slice()
     .sort(compareEvidence)[0];
 }

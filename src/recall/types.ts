@@ -49,7 +49,11 @@ export interface RecallDiagnostics {
   finalIds?: string[];
   rejections?: { id: string; reason: string }[];
   operations?: RecallOperationDiagnostics;
+  stageMs?: Partial<Record<RecallStage, number>>;
 }
+
+export type RecallStage = "setup" | "querySignals" | "candidateGeneration" | "candidateHydration"
+  | "graphExpansion" | "finalHydration" | "selection" | "synthesis" | "total";
 
 export interface RecallOperationDiagnostics {
   aiCalls: number;
