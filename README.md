@@ -391,11 +391,11 @@ All release binaries are built from this repository's source by GitHub Actions (
 ## Star History
 
 <a href="https://www.star-history.com/?repos=rahilp%2Fsecond-brain-cloudflare&type=date&legend=top-left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=rahilp/second-brain-cloudflare&type=date&theme=dark&legend=top-left" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=rahilp/second-brain-cloudflare&type=date&legend=top-left" />
-    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=rahilp/second-brain-cloudflare&type=date&legend=top-left" />
-  </picture>
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=rahilp/second-brain-cloudflare&type=date&theme=dark&legend=top-left&sealed_token=lbb40K-lIek3qXBEOcIcJcbSuOyrPzQgS3geQiY0-QqRpeogir2_DuXSOMrkj3dDJbgbSkUHxjfVoyn4nt_a_JMQQbdsH76GgOtnjPDQJqhUk7SXjILgQsWEqGkvEtYAJT7SGU9I7Atv41s1M-IwZVHr5U4NbINMmlVGlk25_CP-1STiobzyt7B3aw7N" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=rahilp/second-brain-cloudflare&type=date&legend=top-left&sealed_token=lbb40K-lIek3qXBEOcIcJcbSuOyrPzQgS3geQiY0-QqRpeogir2_DuXSOMrkj3dDJbgbSkUHxjfVoyn4nt_a_JMQQbdsH76GgOtnjPDQJqhUk7SXjILgQsWEqGkvEtYAJT7SGU9I7Atv41s1M-IwZVHr5U4NbINMmlVGlk25_CP-1STiobzyt7B3aw7N" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=rahilp/second-brain-cloudflare&type=date&legend=top-left&sealed_token=lbb40K-lIek3qXBEOcIcJcbSuOyrPzQgS3geQiY0-QqRpeogir2_DuXSOMrkj3dDJbgbSkUHxjfVoyn4nt_a_JMQQbdsH76GgOtnjPDQJqhUk7SXjILgQsWEqGkvEtYAJT7SGU9I7Atv41s1M-IwZVHr5U4NbINMmlVGlk25_CP-1STiobzyt7B3aw7N" />
+ </picture>
 </a>
 
 [MIT License](LICENSE) · [Discussions](https://github.com/rahilp/second-brain-cloudflare/discussions)
