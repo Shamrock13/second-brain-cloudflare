@@ -13,6 +13,7 @@ mod commands;
 mod credits;
 mod demo_brain;
 mod i18n;
+mod logging;
 mod mcp_config;
 mod migration;
 mod password_check;
@@ -150,11 +151,11 @@ fn load_setup_unless_dry_run(
 
 pub fn run() {
     // Errors from provisioning etc. print to stderr (visible under `tauri dev`
-    // or when launched from a terminal). Override with RUST_LOG.
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,second_brain_desktop_lib=debug"),
-    )
-    .try_init();
+    // or when launched from a terminal) *and* append to a bounded, scrubbed
+    // file on disk — the only copy a normal launch ever produces, and the one
+    // thing that turns "it said my sign-in expired" into a debuggable report.
+    // Override the level with RUST_LOG. See `logging`.
+    logging::init();
 
     let dry_run = std::env::var("SECOND_BRAIN_DRY_RUN").is_ok();
 

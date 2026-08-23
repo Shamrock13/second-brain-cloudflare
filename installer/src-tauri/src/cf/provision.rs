@@ -76,6 +76,13 @@ pub enum ProvisionError {
     Api(#[from] CfApiError),
     #[error("the new Second Brain deployed but isn't answering its health check yet")]
     HealthCheckFailed,
+    /// The brain came up and *refused* the password the app sent it — every
+    /// health attempt spent on [`CfApiError::WorkerAuthRejected`]. A different
+    /// failure from never coming up at all, and it needs a different answer from
+    /// the person reading the screen: re-authorising Cloudflare cannot fix it,
+    /// and neither can waiting longer.
+    #[error("your Second Brain refused the password the app sent it")]
+    WorkerAuthRejected,
     #[error("the end-to-end write test failed")]
     CaptureFailed,
     #[error("could not reserve a web address for this space")]
@@ -129,6 +136,11 @@ pub trait Backend {
     /// has to wait for; see [`super::api::worker_auth_ok`] for why the two must
     /// not be merged, and [`rotate_secret`] for what merging them costs.
     async fn auth_ok(&self, worker_url: &str, auth_token: &str) -> Result<bool, CfApiError>;
+    /// The same `/health` with no credentials: does whatever is listening
+    /// demand authentication at all? The control arm that tells a real password
+    /// rejection apart from a stale edge node still serving the previous
+    /// deployment — see [`super::api::worker_requires_auth`].
+    async fn requires_auth(&self, worker_url: &str) -> Result<bool, CfApiError>;
     async fn capture_ok(&self, worker_url: &str, auth_token: &str) -> Result<bool, CfApiError>;
     /// The deployed script's current bindings (for a preserve-everything update).
     async fn get_script_bindings(&self, script: &str)
@@ -365,28 +377,85 @@ pub async fn provision<B: Backend>(
         backend.set_cron(script, &manifest.cron).await?;
         backend.enable_script_subdomain(script).await?;
 
-        // Fresh workers.dev hostnames can take a little while to resolve.
+        // Fresh workers.dev hostnames can take a little while to resolve — and,
+        // less obviously, so can the deploy itself: edge nodes keep serving the
+        // previous version, holding the previous secret, until the new upload
+        // reaches them. Both look like this poll failing, and only the second
+        // one looks like a 401.
+        //
+        // A refusal here used to be terminal (#315): the brain refusing the very
+        // password this deploy carried aborted setup on the spot — and one layer
+        // up was reported as "your Cloudflare sign-in expired", which sent the
+        // user re-authorising a session that was never the problem. But a
+        // refusal inside this window is *expected*, exactly as it is during a
+        // rotation's wait (see `rotate_secret` below), so it rides the same
+        // ladder. What the last attempt saw decides how the exhaustion is
+        // reported: a brain that refused every probe is a different problem
+        // from one that never answered at all.
         let mut healthy = false;
+        let mut refused_last = false;
         for attempt in 0..HEALTH_ATTEMPTS {
             match backend.health_ok(&worker_url, auth_token).await {
                 Ok(true) => {
                     healthy = true;
                     break;
                 }
-                Ok(false) => {}
-                Err(CfApiError::Unauthorized) => return Err(ProvisionError::HealthCheckFailed),
-                Err(_) => {} // network/DNS not ready yet — keep waiting
+                Ok(false) => refused_last = false,
+                Err(CfApiError::WorkerAuthRejected) => refused_last = true,
+                Err(_) => refused_last = false, // network/DNS not ready yet — keep waiting
             }
             if attempt + 1 < HEALTH_ATTEMPTS {
                 backend.sleep(HEALTH_WAIT).await;
             }
         }
         if !healthy {
+            if refused_last {
+                // The refused ladder cannot tell its two causes apart on its
+                // own, so ask the one question that can: would this address
+                // have refused *anyone*? A live brain demanding auth means the
+                // password really was rejected; anything else means the version
+                // answering was not the deployment just uploaded.
+                match backend.requires_auth(&worker_url).await {
+                    Ok(true) => log::info!(
+                        "setup: the deployed brain is live and rejected the password it was \
+                         deployed with"
+                    ),
+                    Ok(false) => log::info!(
+                        "setup: an unauthenticated /health was not refused — the version \
+                         answering may predate the deployment just uploaded"
+                    ),
+                    Err(e) => log::debug!("setup: control probe could not run: {e}"),
+                }
+                return Err(ProvisionError::WorkerAuthRejected);
+            }
             return Err(ProvisionError::HealthCheckFailed);
         }
-        // One real write, once, per Appendix A — duplicates on re-run pass.
-        if !backend.capture_ok(&worker_url, auth_token).await? {
-            return Err(ProvisionError::CaptureFailed);
+        // One real write, once, per Appendix A — duplicates on re-run pass. The
+        // write rides the same propagation window the poll just rode out: an
+        // edge node that answered `/health` with the previous secret can serve
+        // `/capture` too. Its refusal gets the same patience; everything else
+        // stays what it always was.
+        let mut captured = false;
+        for attempt in 0..HEALTH_ATTEMPTS {
+            match backend.capture_ok(&worker_url, auth_token).await {
+                // A definite no is a real failure — retrying would only repeat
+                // it.
+                Ok(false) => return Err(ProvisionError::CaptureFailed),
+                Ok(true) => {
+                    captured = true;
+                    break;
+                }
+                Err(CfApiError::WorkerAuthRejected) => {}
+                Err(e) => return Err(e.into()),
+            }
+            if attempt + 1 < HEALTH_ATTEMPTS {
+                backend.sleep(HEALTH_WAIT).await;
+            }
+        }
+        if !captured {
+            // The loop only ever runs to exhaustion on refusals — every other
+            // outcome returns from inside it.
+            return Err(ProvisionError::WorkerAuthRejected);
         }
         Ok::<_, ProvisionError>(())
     });
@@ -498,8 +567,13 @@ pub async fn update_worker<B: Backend>(
                     break;
                 }
                 // A wrong token here means the secret was NOT preserved — fail
-                // rather than silently locking the user out.
-                Err(CfApiError::Unauthorized) => return Err(ProvisionError::HealthCheckFailed),
+                // rather than silently locking the user out. Deliberately not
+                // the fresh-deploy ladder above: this poll uses the password the
+                // app already had, so a refusal is a lost secret, and waiting
+                // only delays telling the user they are locked out.
+                Err(CfApiError::WorkerAuthRejected) => {
+                    return Err(ProvisionError::WorkerAuthRejected)
+                }
                 Ok(false) | Err(_) => {}
             }
             if attempt + 1 < HEALTH_ATTEMPTS {
@@ -594,7 +668,7 @@ pub async fn rotate_secret<B: Backend>(
             // slower than one probe into a reported failure — of a rotation
             // that then succeeds seconds later, leaving the user with a
             // password the app told them was not applied.
-            Err(CfApiError::Unauthorized) => {}
+            Err(CfApiError::WorkerAuthRejected) => {}
             // Nothing answered yet — DNS/network still catching up.
             Ok(false) | Err(_) => {}
         }
@@ -649,9 +723,17 @@ mod tests {
         /// Probes to answer with a 401 before anything else, standing in for a
         /// secret that has not propagated to the edge yet.
         health_unauthorized: Mutex<u32>,
+        /// Refusals scripted for the capture smoke test only, so a test about
+        /// the write's propagation window does not have to share its script
+        /// with the health poll's.
+        capture_unauthorized: Mutex<u32>,
         /// Every probe of either kind, answered or not — a count the log cannot
         /// give, since the log only records the ones that pass.
         probe_calls: Mutex<u32>,
+        /// How many times the control arm was asked — the behavioural difference
+        /// between an exhausted-by-refusal ladder (which asks it) and one
+        /// exhausted by anything else (which has no password question to ask).
+        control_probes: Mutex<u32>,
         /// A brain that is up and authenticating with a broken vector index:
         /// `health_ok` answers no for as long as it lasts, `auth_ok` still says
         /// the password is good. This is the state that made a rotation gated on
@@ -676,7 +758,7 @@ mod tests {
             let mut unauthorized = self.health_unauthorized.lock().unwrap();
             if *unauthorized > 0 {
                 *unauthorized -= 1;
-                return Some(Err(CfApiError::Unauthorized));
+                return Some(Err(CfApiError::WorkerAuthRejected));
             }
             let mut failures = self.health_failures.lock().unwrap();
             if *failures > 0 {
@@ -787,6 +869,12 @@ mod tests {
             self.log("auth_ok");
             Ok(true)
         }
+        async fn requires_auth(&self, _url: &str) -> Result<bool, CfApiError> {
+            *self.control_probes.lock().unwrap() += 1;
+            // The fake's answer stands in for a live brain: whatever refused
+            // the ladder was the real deployment demanding credentials.
+            Ok(true)
+        }
         async fn put_secret(
             &self,
             script: &str,
@@ -797,6 +885,13 @@ mod tests {
             Ok(())
         }
         async fn capture_ok(&self, _url: &str, _token: &str) -> Result<bool, CfApiError> {
+            *self.probe_calls.lock().unwrap() += 1;
+            let mut refused = self.capture_unauthorized.lock().unwrap();
+            if *refused > 0 {
+                *refused -= 1;
+                return Err(CfApiError::WorkerAuthRejected);
+            }
+            drop(refused);
             self.log("capture_ok");
             Ok(true)
         }
@@ -879,6 +974,114 @@ mod tests {
         assert!(fake.entries().contains(&"capture_ok".to_string()));
     }
 
+    /// A brain refusing its freshly deployed password is what a real redeploy
+    /// looks like for a few seconds at the edge — every node still serving the
+    /// previous version holds the previous secret. Setup must ride that out,
+    /// exactly as a rotation's confirm poll does; aborting on the first refusal
+    /// turned a normal deployment into "your Cloudflare sign-in expired"
+    /// (discussion #315).
+    #[tokio::test]
+    async fn setup_rides_out_the_deployed_password_propagating() {
+        let fake = Fake {
+            health_unauthorized: Mutex::new(3),
+            ..Default::default()
+        };
+        provision(&&fake, &test_manifest(), "acct", "pw-123456789012", |_| {})
+            .await
+            .unwrap();
+
+        // Three refusals spent by the poll, one green probe, then the capture
+        // write — which only happens when the poll let setup through.
+        assert_eq!(
+            *fake.probe_calls.lock().unwrap(),
+            5,
+            "the poll must retry through refusals, not abort on the first"
+        );
+        assert!(fake.entries().contains(&"capture_ok".to_string()));
+    }
+
+    /// …but a brain that refuses every probe never came around, and the failure
+    /// has to say *that* rather than "didn't answer its health check": the two
+    /// need different responses from the person reading the screen, and only one
+    /// of them was being blamed on Cloudflare.
+    #[tokio::test]
+    async fn setup_names_a_brain_that_never_accepted_its_password() {
+        let fake = Fake {
+            health_unauthorized: Mutex::new(HEALTH_ATTEMPTS + 5),
+            ..Default::default()
+        };
+        let err = provision(&&fake, &test_manifest(), "acct", "pw-123456789012", |_| {})
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ProvisionError::WorkerAuthRejected),
+            "expected WorkerAuthRejected, got {err:?}"
+        );
+        assert_eq!(
+            *fake.probe_calls.lock().unwrap(),
+            HEALTH_ATTEMPTS,
+            "every attempt is used before giving up — but no more"
+        );
+        assert!(
+            !err.to_string().contains("Cloudflare"),
+            "the brain's own refusal must not be dressed up as a sign-in problem: {err}"
+        );
+    }
+
+    /// The capture write rides the same propagation window the poll just rode
+    /// out: an edge node serving the previous secret can refuse `/capture` too.
+    /// Its refusal gets the same patience, without turning a real `Ok(false)`
+    /// into a retry loop.
+    #[tokio::test]
+    async fn capture_smoke_test_rides_out_the_same_window() {
+        let fake = Fake {
+            capture_unauthorized: Mutex::new(2),
+            ..Default::default()
+        };
+        provision(&&fake, &test_manifest(), "acct", "pw-123456789012", |_| {})
+            .await
+            .unwrap();
+        assert!(
+            fake.entries().contains(&"capture_ok".to_string()),
+            "the write must land once the window closes: {:?}",
+            fake.entries()
+        );
+    }
+
+    /// The control arm is asked exactly when refusals — and nothing else —
+    /// exhaust the ladder: that is the one failure whose cause the refused
+    /// probes cannot name. A brain that never answered is a different failure
+    /// with no password question in it.
+    #[tokio::test]
+    async fn the_control_probe_is_asked_when_refusals_exhaust_the_ladder() {
+        let refused = Fake {
+            health_unauthorized: Mutex::new(HEALTH_ATTEMPTS + 5),
+            ..Default::default()
+        };
+        let _ = provision(&&refused, &test_manifest(), "acct", "pw-123456789012", |_| {}).await;
+        assert_eq!(
+            *refused.control_probes.lock().unwrap(),
+            1,
+            "exhausted by refusals: ask whether what refused us was really the \
+             deployment just uploaded"
+        );
+
+        let unanswered = Fake {
+            health_failures: Mutex::new(HEALTH_ATTEMPTS + 5),
+            ..Default::default()
+        };
+        let err = provision(&&unanswered, &test_manifest(), "acct", "pw-123456789012", |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProvisionError::HealthCheckFailed));
+        assert_eq!(
+            *unanswered.control_probes.lock().unwrap(),
+            0,
+            "nothing refused anything here, so there is no password question to ask"
+        );
+    }
+
     #[tokio::test]
     async fn progress_events_cover_all_steps() {
         let fake = Fake::default();
@@ -950,6 +1153,44 @@ mod tests {
         // Password preserved, not re-sent.
         assert!(!bindings.iter().any(|b| b["type"] == "secret_text"));
         assert_eq!(meta["keep_bindings"], serde_json::json!(["secret_text", "secret_key"]));
+    }
+
+    /// The inversion guard's other half. An update polls with the password the
+    /// app already had, so a refusal means the redeploy dropped the secret and
+    /// waiting cannot help — it fails on the first refusal, and names the
+    /// password rather than the health check, because the honest answer is what
+    /// stops someone from retrying an update that can only fail again.
+    #[tokio::test]
+    async fn update_fails_fast_when_the_preserved_password_is_refused() {
+        let fake = Fake {
+            script_bindings: vec![
+                serde_json::json!({ "type": "d1", "name": "DB", "database_id": "d1" }),
+                serde_json::json!({ "type": "kv_namespace", "name": "OAUTH_KV", "namespace_id": "kv" }),
+            ],
+            health_unauthorized: Mutex::new(HEALTH_ATTEMPTS + 5),
+            ..Default::default()
+        };
+        let err = update_worker(
+            &&fake,
+            &test_manifest(),
+            "https://second-brain.acme.workers.dev",
+            "stored-token",
+            VectorizeTarget::shipped(&test_manifest()),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ProvisionError::WorkerAuthRejected),
+            "expected WorkerAuthRejected, got {err:?}"
+        );
+        assert_eq!(
+            *fake.probe_calls.lock().unwrap(),
+            1,
+            "terminal on the first refusal: retrying an update whose secret was \
+             dropped only delays telling the user"
+        );
     }
 
     /// #257 — the update deploys to the script named by the address it was
