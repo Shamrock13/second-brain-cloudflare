@@ -217,10 +217,11 @@ impl Backend for DryRunBackend {
     /// demo brain has to take it the same way a real Worker would.
     ///
     /// Without this, running setup again after a demo rotation fails: the health
-    /// poll now genuinely asks the demo brain, the brain is still enforcing the
-    /// rotated password, and `provision`'s poll treats a 401 as terminal. An
-    /// *update* is unaffected and must be — its metadata carries `keep_bindings`
-    /// and no secret, exactly because the app does not know the password then.
+    /// poll genuinely asks the demo brain, which is still enforcing the rotated
+    /// password, and the new deploy's password would stay refused for the whole
+    /// ladder before setup reported the refusal honestly (#315). An *update* is
+    /// unaffected and must be — its metadata carries `keep_bindings` and no
+    /// secret, exactly because the app does not know the password then.
     async fn deploy_worker(
         &self,
         _script: &str,
@@ -240,11 +241,9 @@ impl Backend for DryRunBackend {
             .and_then(|t| t.as_str())
         {
             // `deployed_with`, not `rotate_to`: the secret rides along with this
-            // upload, so the Worker comes up already holding it and there is no
-            // propagation window to model. Routing a deploy through the rotation
-            // path instead pointed `SECOND_BRAIN_DEMO_ROTATE_AFTER` at
-            // `provision`'s health poll — where a 401 is terminal — and killed
-            // demo setup outright whenever the variable was exported.
+            // upload, so the Worker comes up already holding it and normally
+            // there is no propagation window to model — `DEPLOY_ENV`
+            // reintroduces one on purpose for the tests that need it.
             crate::demo_brain::deployed_with(token);
         }
         Ok(())
@@ -453,12 +452,70 @@ mod tests {
         crate::cf::provision::provision(
             &DryRunBackend,
             &crate::worker_bundle::manifest(),
-            "Demo Account",
+            "Demo Space",
             "a-password-only-this-test-sets",
             |_| {},
         )
         .await
         .expect("a demo setup must not be broken by a knob meant for rotation");
+    }
+
+    /// End to end against a brain whose freshly deployed password refuses for a
+    /// few probes — the state real edge nodes produce for a few seconds after
+    /// every redeploy, and the state discussion #315 turned into "your
+    /// Cloudflare sign-in expired". Setup must simply take longer.
+    #[tokio::test]
+    async fn a_dry_run_setup_rides_out_a_stale_edge() {
+        let _brain = demo_brain::scoped_brain_with(demo_brain::Options {
+            deploy_after: Some(5),
+            ..demo_brain::test_options()
+        });
+
+        crate::cf::provision::provision(
+            &DryRunBackend,
+            &crate::worker_bundle::manifest(),
+            "Demo Space",
+            "a-password-only-this-test-sets",
+            |_| {},
+        )
+        .await
+        .expect("refusals inside the propagation window are not a failed setup");
+    }
+
+    /// …and when the window never closes, setup fails saying *that*: the brain
+    /// refused the password, not Cloudflare, and not its own health check. This
+    /// is the exact assertion the old code could not pass — it aborted on the
+    /// first refusal with an error that reached the user as "Cloudflare sign-in
+    /// expired".
+    #[tokio::test]
+    async fn a_dry_run_setup_names_the_password_when_it_never_lands() {
+        let _brain = demo_brain::scoped_brain_with(demo_brain::Options {
+            // More refusals than any ladder can spend.
+            deploy_after: Some(u64::MAX),
+            ..demo_brain::test_options()
+        });
+
+        let err = crate::cf::provision::provision(
+            &DryRunBackend,
+            &crate::worker_bundle::manifest(),
+            "Demo Space",
+            "a-password-only-this-test-sets",
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::cf::provision::ProvisionError::WorkerAuthRejected
+            ),
+            "expected WorkerAuthRejected, got {err:?}"
+        );
+        assert!(
+            !err.to_string().to_lowercase().contains("cloudflare"),
+            "the brain's refusal must not be dressed up as a sign-in problem: {err}"
+        );
     }
 
     /// The dry-run health check has to be capable of saying no.

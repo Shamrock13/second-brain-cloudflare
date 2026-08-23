@@ -153,6 +153,7 @@ pub enum Key {
     ErrorComputerNotSetup,
     ErrorCustomDomain,
     ErrorWrongCfAccount,
+    ErrorBrainRefusedPassword,
     ErrorProvisioningDetail,
     ErrorBrainHttpStatus,
     ErrorBrainUnexpected,
@@ -326,6 +327,10 @@ Second Brain's address by hand instead."
         }
         (Locale::En, Key::ErrorWrongCfAccount) => {
             "That Cloudflare account doesn't host this Second Brain. Sign in with the account you set it up in."
+        }
+        (Locale::En, Key::ErrorBrainRefusedPassword) => {
+            "Your Second Brain wouldn't accept the password this computer has saved. If its \
+             password was changed somewhere else, use that one instead."
         }
         (Locale::En, Key::ErrorProvisioningDetail) => "What went wrong: {detail}",
         (Locale::En, Key::ErrorBrainHttpStatus) => "Your Second Brain returned {status}.",
@@ -521,6 +526,10 @@ Puoi inserire a mano l'indirizzo del tuo Second Brain."
         (Locale::It, Key::ErrorWrongCfAccount) => {
             "Questo account Cloudflare non ospita questo Second Brain. Accedi con l'account usato per la configurazione."
         }
+        (Locale::It, Key::ErrorBrainRefusedPassword) => {
+            "Il tuo Second Brain non ha accettato la password salvata su questo computer. Se la \
+             password è stata cambiata su un altro dispositivo, usa quella."
+        }
         (Locale::It, Key::ErrorProvisioningDetail) => "Cosa è andato storto: {detail}",
         (Locale::It, Key::ErrorBrainHttpStatus) => "Il Second Brain ha risposto con {status}.",
         (Locale::It, Key::ErrorBrainUnexpected) => "Risposta inattesa dal Second Brain.",
@@ -688,6 +697,7 @@ mod tests {
             ErrorComputerNotSetup,
             ErrorCustomDomain,
             ErrorWrongCfAccount,
+            ErrorBrainRefusedPassword,
             ErrorProvisioningDetail,
             ErrorBrainHttpStatus,
             ErrorBrainUnexpected,

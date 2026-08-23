@@ -1157,6 +1157,13 @@ pub async fn start_worker_update(
                 // subdomain check above is ever removed — the message is right
                 // either way.
                 ProvisionError::NotAWorkersDevAddress => user_err(locale, Key::ErrorCustomDomain),
+                // The updated brain refused the password this computer kept.
+                // "Nothing is lost, try again" would be the one thing worse than
+                // silence here: the likeliest cause is a password changed on
+                // another device, and retrying an update cannot fix that.
+                ProvisionError::WorkerAuthRejected => {
+                    user_err(locale, Key::ErrorBrainRefusedPassword)
+                }
                 _ => user_err(locale, Key::ErrorFriendlyRetry),
             }
         })?;
@@ -1263,7 +1270,7 @@ fn rotation_failure(error: ProvisionError, locale: Locale) -> RotateError {
         ProvisionError::NotAWorkersDevAddress => {
             RotateError::not_sent(user_err(locale, Key::ErrorCustomDomain))
         }
-        ProvisionError::HealthCheckFailed => {
+        ProvisionError::HealthCheckFailed | ProvisionError::WorkerAuthRejected => {
             RotateError::unconfirmed(user_err(locale, Key::ErrorRotateNotConfirmed))
         }
         // From `put_secret`. The detail still names the real cause — the stage
