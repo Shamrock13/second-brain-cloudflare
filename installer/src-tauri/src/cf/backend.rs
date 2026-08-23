@@ -306,8 +306,20 @@ impl Backend for DryRunBackend {
             None => Ok(true),
         }
     }
-    async fn capture_ok(&self, _worker_url: &str, _auth_token: &str) -> Result<bool, CfApiError> {
-        Ok(true)
+    /// The end-to-end write test, resolved through the demo brain exactly like
+    /// [`Self::health_ok`] — see [`demo_health_target`]. It used to answer
+    /// `Ok(true)` from a constant, which made provision's capture smoke test the
+    /// one step in the whole flow a dry run faked; against a brain refusing its
+    /// freshly deployed password ([`DEPLOY_ENV`] — discussion #315) that step is
+    /// precisely where the interesting failure lives.
+    async fn capture_ok(&self, worker_url: &str, auth_token: &str) -> Result<bool, CfApiError> {
+        self.pause().await;
+        match demo_health_target(worker_url) {
+            // `worker_capture_ok` maps a 401 to `WorkerAuthRejected`, which
+            // provision's capture ladder reads as "not landed yet" and retries.
+            Some(url) => api::worker_capture_ok(&url, auth_token).await,
+            None => Ok(true),
+        }
     }
     async fn get_script_bindings(
         &self,
@@ -479,5 +491,56 @@ mod tests {
         assert!(demo_health_target("https://second-brain.acme.workers.dev").is_none());
         assert!(demo_health_target("https://second-brain.demo.workers.dev").is_some());
         assert!(demo_health_target("http://127.0.0.1:8787").is_some());
+    }
+
+    /// A freshly *deployed* password can be made to propagate slowly, which is
+    /// the state a real redeploy produces for a few seconds at the edge and the
+    /// state behind discussion #315. The deploy lands, the brain refuses the
+    /// password it was deployed with for exactly as long as [`DEPLOY_ENV`]
+    /// (here, the knob set by hand) says — while anything else still opens it,
+    /// because what is live until then is the *previous* deployment's secret.
+    ///
+    /// This is the harness every provision-ladder test below drives: without it
+    /// those tests can only prove how the ladder behaves against a brain that
+    /// never refuses anyone.
+    #[tokio::test]
+    async fn a_deployed_password_can_be_made_to_propagate_slowly() {
+        let _brain = demo_brain::scoped_brain_with(demo_brain::Options {
+            deploy_after: Some(2),
+            ..demo_brain::test_options()
+        });
+        let address = "https://second-brain.demo.workers.dev";
+        DryRunBackend
+            .deploy_worker(
+                "second-brain",
+                &serde_json::json!({
+                    "bindings": [
+                        { "type": "secret_text", "name": "AUTH_TOKEN", "text": "pw-deployed-here" }
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+
+        // The new password, refused twice — one refusal spent per authed probe.
+        assert!(
+            matches!(
+                DryRunBackend.auth_ok(address, "pw-deployed-here").await,
+                Err(CfApiError::WorkerAuthRejected)
+            ),
+            "a deployed password must be refusable while the edge catches up"
+        );
+        assert!(
+            matches!(
+                DryRunBackend.auth_ok(address, "pw-deployed-here").await,
+                Err(CfApiError::WorkerAuthRejected)
+            ),
+            "the second attempt must still be inside the propagation window"
+        );
+        // …and land on the third, exactly as configured.
+        assert!(
+            matches!(DryRunBackend.auth_ok(address, "pw-deployed-here").await, Ok(true)),
+            "the window must close after exactly the configured number of refusals"
+        );
     }
 }
