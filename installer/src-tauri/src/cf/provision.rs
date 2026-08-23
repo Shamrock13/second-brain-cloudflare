@@ -136,6 +136,11 @@ pub trait Backend {
     /// has to wait for; see [`super::api::worker_auth_ok`] for why the two must
     /// not be merged, and [`rotate_secret`] for what merging them costs.
     async fn auth_ok(&self, worker_url: &str, auth_token: &str) -> Result<bool, CfApiError>;
+    /// The same `/health` with no credentials: does whatever is listening
+    /// demand authentication at all? The control arm that tells a real password
+    /// rejection apart from a stale edge node still serving the previous
+    /// deployment — see [`super::api::worker_requires_auth`].
+    async fn requires_auth(&self, worker_url: &str) -> Result<bool, CfApiError>;
     async fn capture_ok(&self, worker_url: &str, auth_token: &str) -> Result<bool, CfApiError>;
     /// The deployed script's current bindings (for a preserve-everything update).
     async fn get_script_bindings(&self, script: &str)
@@ -404,11 +409,26 @@ pub async fn provision<B: Backend>(
             }
         }
         if !healthy {
-            return Err(if refused_last {
-                ProvisionError::WorkerAuthRejected
-            } else {
-                ProvisionError::HealthCheckFailed
-            });
+            if refused_last {
+                // The refused ladder cannot tell its two causes apart on its
+                // own, so ask the one question that can: would this address
+                // have refused *anyone*? A live brain demanding auth means the
+                // password really was rejected; anything else means the version
+                // answering was not the deployment just uploaded.
+                match backend.requires_auth(&worker_url).await {
+                    Ok(true) => log::info!(
+                        "setup: the deployed brain is live and rejected the password it was \
+                         deployed with"
+                    ),
+                    Ok(false) => log::info!(
+                        "setup: an unauthenticated /health was not refused — the version \
+                         answering may predate the deployment just uploaded"
+                    ),
+                    Err(e) => log::debug!("setup: control probe could not run: {e}"),
+                }
+                return Err(ProvisionError::WorkerAuthRejected);
+            }
+            return Err(ProvisionError::HealthCheckFailed);
         }
         // One real write, once, per Appendix A — duplicates on re-run pass. The
         // write rides the same propagation window the poll just rode out: an
@@ -710,6 +730,10 @@ mod tests {
         /// Every probe of either kind, answered or not — a count the log cannot
         /// give, since the log only records the ones that pass.
         probe_calls: Mutex<u32>,
+        /// How many times the control arm was asked — the behavioural difference
+        /// between an exhausted-by-refusal ladder (which asks it) and one
+        /// exhausted by anything else (which has no password question to ask).
+        control_probes: Mutex<u32>,
         /// A brain that is up and authenticating with a broken vector index:
         /// `health_ok` answers no for as long as it lasts, `auth_ok` still says
         /// the password is good. This is the state that made a rotation gated on
@@ -843,6 +867,12 @@ mod tests {
             // Deliberately blind to `degraded_vector_index`: the only question
             // this probe answers is whether the password was accepted.
             self.log("auth_ok");
+            Ok(true)
+        }
+        async fn requires_auth(&self, _url: &str) -> Result<bool, CfApiError> {
+            *self.control_probes.lock().unwrap() += 1;
+            // The fake's answer stands in for a live brain: whatever refused
+            // the ladder was the real deployment demanding credentials.
             Ok(true)
         }
         async fn put_secret(
@@ -1016,6 +1046,39 @@ mod tests {
             fake.entries().contains(&"capture_ok".to_string()),
             "the write must land once the window closes: {:?}",
             fake.entries()
+        );
+    }
+
+    /// The control arm is asked exactly when refusals — and nothing else —
+    /// exhaust the ladder: that is the one failure whose cause the refused
+    /// probes cannot name. A brain that never answered is a different failure
+    /// with no password question in it.
+    #[tokio::test]
+    async fn the_control_probe_is_asked_when_refusals_exhaust_the_ladder() {
+        let refused = Fake {
+            health_unauthorized: Mutex::new(HEALTH_ATTEMPTS + 5),
+            ..Default::default()
+        };
+        let _ = provision(&&refused, &test_manifest(), "acct", "pw-123456789012", |_| {}).await;
+        assert_eq!(
+            *refused.control_probes.lock().unwrap(),
+            1,
+            "exhausted by refusals: ask whether what refused us was really the \
+             deployment just uploaded"
+        );
+
+        let unanswered = Fake {
+            health_failures: Mutex::new(HEALTH_ATTEMPTS + 5),
+            ..Default::default()
+        };
+        let err = provision(&&unanswered, &test_manifest(), "acct", "pw-123456789012", |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProvisionError::HealthCheckFailed));
+        assert_eq!(
+            *unanswered.control_probes.lock().unwrap(),
+            0,
+            "nothing refused anything here, so there is no password question to ask"
         );
     }
 

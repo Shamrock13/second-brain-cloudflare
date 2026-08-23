@@ -538,6 +538,28 @@ pub async fn probe_worker(worker_url: &str, auth_token: &str) -> Result<WorkerPr
     Ok(body["ok"] == true && body["vectorize"]["ok"] == true)
 }
 
+/// GET /health with **no credentials** — one question: is whatever is listening
+/// a brain that demands authentication?
+///
+/// This is the control arm the authenticated probes cannot provide for
+/// themselves. A 401 with a bearer token means *something* refused the
+/// password — but not whether that something is the current deployment (a real
+/// password problem) or a stale edge node still serving the previous one,
+/// holding the previous secret (a wait-it-out problem, invisible once setup has
+/// already given up). Asking the same URL unauthenticated separates them: a
+/// 401 there means the live version demands auth, so the refusal was real;
+/// anything else means the answering version would not have refused anyone, so
+/// what the poll talked to was not the deployment just uploaded.
+pub async fn worker_requires_auth(worker_url: &str) -> Result<bool, CfApiError> {
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("{worker_url}/health"))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await?;
+    Ok(resp.status().as_u16() == 401)
+}
+
 /// GET /health, asking one question only: **does this password open this
 /// brain?**
 ///
@@ -1318,6 +1340,39 @@ mod tests {
         assert!(
             worker_auth_ok("http://127.0.0.1:1/nothing", "pw").await.is_err(),
             "nothing answered, so nothing accepted the password"
+        );
+    }
+
+    /// The control arm: the same `/health` with no credentials, answering one
+    /// question — would this address refuse anyone? This is what separates
+    /// "the live brain rejected its password" from "a stale edge node still
+    /// serving the previous deployment answered the poll".
+    #[tokio::test]
+    async fn the_unauthenticated_control_probe_classifies_the_same_two_ways() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            loop {
+                let Ok(req) = server.recv() else { return };
+                let status = if req.url().starts_with("/demanding") { 401 } else { 200 };
+                let _ = req.respond(
+                    tiny_http::Response::from_string(r#"{"ok":true}"#).with_status_code(status),
+                );
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+
+        assert!(
+            matches!(worker_requires_auth(&format!("{base}/demanding")).await, Ok(true)),
+            "a 401 with no credentials is a brain demanding auth"
+        );
+        assert!(
+            matches!(worker_requires_auth(&format!("{base}/permissive")).await, Ok(false)),
+            "any other answer means this version would not have refused the poll"
+        );
+        assert!(
+            worker_requires_auth("http://127.0.0.1:1/nothing").await.is_err(),
+            "nothing listening is an error, not an answer"
         );
     }
 }

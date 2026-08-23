@@ -74,6 +74,9 @@ impl Backend for LiveBackend {
     async fn auth_ok(&self, worker_url: &str, auth_token: &str) -> Result<bool, CfApiError> {
         api::worker_auth_ok(worker_url, auth_token).await
     }
+    async fn requires_auth(&self, worker_url: &str) -> Result<bool, CfApiError> {
+        api::worker_requires_auth(worker_url).await
+    }
     async fn capture_ok(&self, worker_url: &str, auth_token: &str) -> Result<bool, CfApiError> {
         api::worker_capture_ok(worker_url, auth_token).await
     }
@@ -302,6 +305,17 @@ impl Backend for DryRunBackend {
             // `WorkerAuthRejected`, which `rotate_secret`'s loop reads as "the
             // new secret has not propagated yet" and retries.
             Some(url) => api::worker_auth_ok(&url, auth_token).await,
+            None => Ok(true),
+        }
+    }
+    /// The control arm, asked of the demo brain through the same addresses as
+    /// [`Self::auth_ok`] — see [`demo_health_target`]. The demo brain refuses
+    /// unauthenticated `/health` requests exactly like the real `requireAuth`,
+    /// so a dry run's diagnosis runs against a real answer.
+    async fn requires_auth(&self, worker_url: &str) -> Result<bool, CfApiError> {
+        self.pause().await;
+        match demo_health_target(worker_url) {
+            Some(url) => api::worker_requires_auth(&url).await,
             None => Ok(true),
         }
     }
