@@ -284,9 +284,9 @@ impl Backend for DryRunBackend {
     async fn health_ok(&self, worker_url: &str, auth_token: &str) -> Result<bool, CfApiError> {
         self.pause().await;
         match demo_health_target(worker_url) {
-            // `worker_health_ok` already maps a 401 to `Unauthorized`, which
-            // `rotate_secret`'s loop reads as "the new secret has not propagated
-            // yet" and retries — the same shape the live path has.
+            // `worker_health_ok` already maps a 401 to `WorkerAuthRejected`,
+            // which `rotate_secret`'s loop reads as "the new secret has not
+            // propagated yet" and retries — the same shape the live path has.
             Some(url) => api::worker_health_ok(&url, auth_token).await,
             None => Ok(true),
         }
@@ -299,9 +299,9 @@ impl Backend for DryRunBackend {
     async fn auth_ok(&self, worker_url: &str, auth_token: &str) -> Result<bool, CfApiError> {
         self.pause().await;
         match demo_health_target(worker_url) {
-            // `worker_auth_ok` maps a 401 — and only a 401 — to `Unauthorized`,
-            // which `rotate_secret`'s loop reads as "the new secret has not
-            // propagated yet" and retries.
+            // `worker_auth_ok` maps a 401 — and only a 401 — to
+            // `WorkerAuthRejected`, which `rotate_secret`'s loop reads as "the
+            // new secret has not propagated yet" and retries.
             Some(url) => api::worker_auth_ok(&url, auth_token).await,
             None => Ok(true),
         }
@@ -412,7 +412,7 @@ mod tests {
                 "{name}: the password that was set must open the demo brain, got {accepted:?}"
             );
             assert!(
-                matches!(refused, Err(CfApiError::Unauthorized)),
+                matches!(refused, Err(CfApiError::WorkerAuthRejected)),
                 "{name}: setting the secret must retire every other password, or \
                  a demo rotation flips nothing and the gate proves nothing. Got \
                  {refused:?}"

@@ -374,7 +374,7 @@ pub async fn provision<B: Backend>(
                     break;
                 }
                 Ok(false) => {}
-                Err(CfApiError::Unauthorized) => return Err(ProvisionError::HealthCheckFailed),
+                Err(CfApiError::WorkerAuthRejected) => return Err(ProvisionError::HealthCheckFailed),
                 Err(_) => {} // network/DNS not ready yet — keep waiting
             }
             if attempt + 1 < HEALTH_ATTEMPTS {
@@ -499,7 +499,7 @@ pub async fn update_worker<B: Backend>(
                 }
                 // A wrong token here means the secret was NOT preserved — fail
                 // rather than silently locking the user out.
-                Err(CfApiError::Unauthorized) => return Err(ProvisionError::HealthCheckFailed),
+                Err(CfApiError::WorkerAuthRejected) => return Err(ProvisionError::HealthCheckFailed),
                 Ok(false) | Err(_) => {}
             }
             if attempt + 1 < HEALTH_ATTEMPTS {
@@ -594,7 +594,7 @@ pub async fn rotate_secret<B: Backend>(
             // slower than one probe into a reported failure — of a rotation
             // that then succeeds seconds later, leaving the user with a
             // password the app told them was not applied.
-            Err(CfApiError::Unauthorized) => {}
+            Err(CfApiError::WorkerAuthRejected) => {}
             // Nothing answered yet — DNS/network still catching up.
             Ok(false) | Err(_) => {}
         }
@@ -676,7 +676,7 @@ mod tests {
             let mut unauthorized = self.health_unauthorized.lock().unwrap();
             if *unauthorized > 0 {
                 *unauthorized -= 1;
-                return Some(Err(CfApiError::Unauthorized));
+                return Some(Err(CfApiError::WorkerAuthRejected));
             }
             let mut failures = self.health_failures.lock().unwrap();
             if *failures > 0 {

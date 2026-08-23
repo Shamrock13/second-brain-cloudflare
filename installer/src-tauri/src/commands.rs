@@ -970,7 +970,10 @@ async fn launch_check(dry_run: bool) -> LaunchCheck {
     // launch for custom-domain users, who previously skipped it.
     let deployed = match crate::cf::api::worker_version(&info.worker_url, &info.auth_token).await {
         Ok(version) => version,
-        Err(CfApiError::Unauthorized) => return LaunchCheck::StalePassword,
+        // The brain refused this computer's password — a password problem, not
+        // a Cloudflare one. `Unauthorized` here would mean the *Cloudflare* API
+        // rejected the request, which is an `Err(e)` like any other.
+        Err(CfApiError::WorkerAuthRejected) => return LaunchCheck::StalePassword,
         // Offline, or a brain having a moment. Neither is a password problem, and
         // telling someone their password changed because their wifi dropped is
         // worse than saying nothing at all.
@@ -1677,7 +1680,9 @@ async fn password_opens_brain(
 ) -> Result<bool, String> {
     match crate::cf::api::worker_auth_ok(worker_url, password.trim()).await {
         Ok(ok) => Ok(ok),
-        Err(CfApiError::Unauthorized) => Ok(false),
+        // A 401 from the brain itself *is* the "no" answer this screen exists
+        // to deliver — not a fault, and never Cloudflare's business.
+        Err(CfApiError::WorkerAuthRejected) => Ok(false),
         Err(e) => {
             log::warn!("password re-check could not reach the brain: {e}");
             Err(user_err(locale, Key::ErrorReachBrain))

@@ -515,19 +515,22 @@ pub async fn probe_worker(worker_url: &str, auth_token: &str) -> Result<WorkerPr
     Ok(WorkerProbe::NotABrain)
 }
 
-/// GET /health — passes only when the Worker is live AND its vector index is
-/// wired (`ok && vectorize.ok`), per the Worker's own health contract.
-pub async fn worker_health_ok(worker_url: &str, auth_token: &str) -> Result<bool, CfApiError> {
-    let http = reqwest::Client::new();
-    let resp = http
-        .get(format!("{worker_url}/health"))
-        .bearer_auth(auth_token)
-        .timeout(Duration::from_secs(20))
-        .send()
-        .await?;
-    if resp.status().as_u16() == 401 {
-        return Err(CfApiError::Unauthorized);
-    }
+    /// GET /health — passes only when the Worker is live AND its vector index is
+    /// wired (`ok && vectorize.ok`), per the Worker's own health contract.
+    pub async fn worker_health_ok(worker_url: &str, auth_token: &str) -> Result<bool, CfApiError> {
+        let http = reqwest::Client::new();
+        let resp = http
+            .get(format!("{worker_url}/health"))
+            .bearer_auth(auth_token)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        if resp.status().as_u16() == 401 {
+            // The brain's own `requireAuth`, not Cloudflare's — see
+            // [`CfApiError::WorkerAuthRejected`] for why the two must not share
+            // an error.
+            return Err(CfApiError::WorkerAuthRejected);
+        }
     if !resp.status().is_success() {
         return Ok(false);
     }
@@ -557,10 +560,10 @@ pub async fn worker_health_ok(worker_url: &str, auth_token: &str) -> Result<bool
 /// using it. There a 401 means a secret was dropped and a degraded index means
 /// the deploy is not finished, so both legitimately want the whole contract.
 ///
-/// Never answers `Ok(false)`. A refusal comes back as `Unauthorized` because the
-/// caller has to tell "the edge is still serving the old secret" apart from a
-/// network error, and a bool cannot carry that; the `bool` is here so the
-/// [`super::provision::Backend`] method mirrors `health_ok` and a dry run can
+/// Never answers `Ok(false)`. A refusal comes back as [`CfApiError::WorkerAuthRejected`]
+/// because the caller has to tell "the edge is still serving the old secret"
+/// apart from a network error, and a bool cannot carry that; the `bool` is here
+/// so the [`super::provision::Backend`] method mirrors `health_ok` and a dry run can
 /// wave through an address with no server behind it.
 pub async fn worker_auth_ok(worker_url: &str, auth_token: &str) -> Result<bool, CfApiError> {
     let http = reqwest::Client::new();
@@ -571,7 +574,7 @@ pub async fn worker_auth_ok(worker_url: &str, auth_token: &str) -> Result<bool, 
         .send()
         .await?;
     if resp.status().as_u16() == 401 {
-        return Err(CfApiError::Unauthorized);
+        return Err(CfApiError::WorkerAuthRejected);
     }
     Ok(true)
 }
@@ -590,7 +593,7 @@ pub async fn worker_version(
         .send()
         .await?;
     if resp.status().as_u16() == 401 {
-        return Err(CfApiError::Unauthorized);
+        return Err(CfApiError::WorkerAuthRejected);
     }
     if !resp.status().is_success() {
         return Ok(None);
@@ -617,7 +620,9 @@ pub async fn worker_capture_ok(worker_url: &str, auth_token: &str) -> Result<boo
         .send()
         .await?;
     if resp.status().as_u16() == 401 {
-        return Err(CfApiError::Unauthorized);
+        // The brain's own `requireAuth`, not Cloudflare's — see
+        // [`CfApiError::WorkerAuthRejected`].
+        return Err(CfApiError::WorkerAuthRejected);
     }
     if !resp.status().is_success() {
         return Ok(false);
@@ -1305,9 +1310,10 @@ mod tests {
         assert!(
             matches!(
                 worker_auth_ok(&format!("{base}/refused"), "pw").await,
-                Err(CfApiError::Unauthorized)
+                Err(CfApiError::WorkerAuthRejected)
             ),
-            "only a 401 means the new secret has not landed yet"
+            "only a 401 means the new secret has not landed yet — and the refusal \
+             is the brain's own, never dressed up as a Cloudflare sign-in problem"
         );
         assert!(
             worker_auth_ok("http://127.0.0.1:1/nothing", "pw").await.is_err(),
