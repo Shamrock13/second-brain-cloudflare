@@ -1,10 +1,7 @@
-import {
-  CHUNK_OVERLAP_CHARS,
-  CONTRADICTION_IMPORTANCE_STEP,
-  TAG_BOOST_MAX,
-  TAG_BOOST_STEP,
-} from "../constants";
+import { CHUNK_OVERLAP_CHARS } from "../constants";
 import { getStatus } from "../memory/status";
+import { getVolatility } from "../memory/volatility";
+import { DEFAULTS, type Config } from "../config";
 
 export interface VectorizeMatch {
   id: string;
@@ -13,13 +10,17 @@ export interface VectorizeMatch {
   values?: number[] | Float32Array | Float64Array;
 }
 
+export interface RerankOptions {
+  useRecallFrequency?: boolean;
+}
+
 // Recency-decay floors: the minimum fraction of its semantic relevance a memory
 // keeps regardless of age (applied in rerankWithTimeDecay). Because decay now
 // bottoms out at a floor instead of exp()-ing toward zero, recency becomes a
 // tie-breaker rather than a gate — a strong old match can no longer be buried
-// under a fresh weak one. Durability sets the floor: settled/important memories
-// barely fade, volatile tasks still do. Staleness is handled by status +
-// contradiction, not by making old memories invisible.
+// under a fresh weak one. Durability sets the floor via volatility: (preferred)
+// or legacy proxies (canonical / importance / task). Time-triggered staleness
+// warnings use stale:as-of tags set by the nightly pass.
 export const RECENCY_FLOOR = 0.6;
 export const RECENCY_FLOOR_DURABLE = 0.9;
 export const RECENCY_FLOOR_VOLATILE = 0.15;
@@ -28,6 +29,16 @@ export const RECENCY_FLOOR_VOLATILE = 0.15;
 // more relevance-focused, lower = more diverse. 0.7 keeps the top hit intact while
 // stopping near-duplicate (usually recent) memories from taking every slot.
 export const MMR_LAMBDA = 0.7;
+
+export function getRecencyFloor(tags: string[], imp: number, config: Readonly<Config> = DEFAULTS): number {
+  if (getStatus(tags) === "canonical" || imp >= 4) return config.RECENCY_FLOOR_DURABLE;
+  const vol = getVolatility(tags);
+  if (vol === "durable") return config.RECENCY_FLOOR_DURABLE;
+  if (vol === "volatile") return config.RECENCY_FLOOR_VOLATILE;
+  if (vol === "state") return config.RECENCY_FLOOR;
+  if (tags.includes("task")) return config.RECENCY_FLOOR_VOLATILE;
+  return config.RECENCY_FLOOR;
+}
 
 export function getHalfLifeMs(tags: string[]): number {
   if (tags.includes("task")) return 7 * 24 * 60 * 60 * 1000;
@@ -52,7 +63,12 @@ export function rerankWithTimeDecay(
   importanceScores: Map<string, number> = new Map(),
   queryTags: string[] = [],
   contradictionWins: Map<string, number> = new Map(),
-  contradictionLosses: Map<string, number> = new Map()
+  contradictionLosses: Map<string, number> = new Map(),
+  d1Tags: Map<string, string[]> = new Map(),
+  // Ranking seam: config in, ordering out. Threaded rather than read from
+  // module scope so this stays pure and directly assertable without an env.
+  config: Readonly<Config> = DEFAULTS,
+  options: Readonly<RerankOptions> = {},
 ): VectorizeMatch[] {
   const now = Date.now();
 
@@ -60,20 +76,18 @@ export function rerankWithTimeDecay(
     .map(match => {
       const meta = match.metadata as any;
       const createdAt = meta?.created_at ?? now;
-      const tags: string[] = Array.isArray(meta?.tags) ? meta.tags : [];
-      const ageMs = now - createdAt;
       const parentId = (meta?.parentId ?? match.id) as string;
+      const metaTags: string[] = Array.isArray(meta?.tags) ? meta.tags : [];
+      const tags: string[] = d1Tags.get(parentId) ?? metaTags;
+      const ageMs = now - createdAt;
       const rc = recallCounts.get(parentId) ?? 0;
 
       const halfLifeMs = getHalfLifeMs(tags);
       const imp = importanceScores.get(parentId) ?? 0;
 
-      const recencyFloor =
-        getStatus(tags) === "canonical" || imp >= 4 ? RECENCY_FLOOR_DURABLE
-        : tags.includes("task") ? RECENCY_FLOOR_VOLATILE
-        : RECENCY_FLOOR;
+      const recencyFloor = getRecencyFloor(tags, imp, config);
       const recencyMultiplier = recencyFloor + (1 - recencyFloor) * Math.exp(-ageMs / halfLifeMs);
-      const frequencyMultiplier = 1 + Math.log1p(rc);
+      const frequencyMultiplier = options.useRecallFrequency === false ? 1 : 1 + Math.log1p(rc);
       const combinedMultiplier = Math.min(1.0, recencyMultiplier * frequencyMultiplier);
       const isShortAppend = match.id.includes("-update-") &&
         typeof meta?.content === "string" && meta.content.length < CHUNK_OVERLAP_CHARS;
@@ -88,13 +102,13 @@ export function rerankWithTimeDecay(
         importanceMultiplier = 1.0;
       } else {
         const base = imp === 0 ? 3 : imp;
-        const adj = Math.sign(net) * Math.log1p(Math.abs(net)) * CONTRADICTION_IMPORTANCE_STEP;
+        const adj = Math.sign(net) * Math.log1p(Math.abs(net)) * config.CONTRADICTION_IMPORTANCE_STEP;
         const effectiveImp = Math.max(1, Math.min(5, base + adj));
         importanceMultiplier = 0.8 + (effectiveImp / 5) * 0.4;
       }
 
       const overlap = queryTags.length ? tags.filter(t => queryTags.includes(t)).length : 0;
-      const tagBoost = overlap ? Math.min(TAG_BOOST_MAX, 1 + overlap * TAG_BOOST_STEP) : 1.0;
+      const tagBoost = overlap ? Math.min(config.TAG_BOOST_MAX, 1 + overlap * config.TAG_BOOST_STEP) : 1.0;
 
       return { ...match, score: match.score * combinedMultiplier * appendPenalty * rolledUpPenalty * importanceMultiplier * tagBoost };
     })

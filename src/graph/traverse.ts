@@ -1,4 +1,5 @@
 import type { Env } from "../env";
+import { DEFAULTS, type Config } from "../config";
 import { D1_MAX_BOUND_PARAMS } from "../constants";
 import { getKind } from "../memory/kind";
 import { getStatus } from "../memory/status";
@@ -8,6 +9,51 @@ import type { Connection, EdgeProvenance, GraphNeighbor, GraphView } from "./typ
 export const GRAPH_MAX_HOPS = 3;
 const GRAPH_FANOUT_CAP = 8;
 const GRAPH_MAX_NODES = 50;
+// Ceiling on the /graph view's node set, applied even when the caller asks for
+// no cap. The binding constraint is the Workers free-plan limit of 50
+// subrequests per invocation, not row reads. buildGraph costs
+//
+//   1 (edge scan) + ceil(N/D1_MAX_BOUND_PARAMS) (node hydration)
+//                 + ceil(N/EDGE_QUERY_BATCH)    (edge hydration)
+//
+// D1 queries for N nodes, plus one KV read for the config. At N=1500 that is
+// 1 + 15 + 30 = 46, or 47 with the KV read. N=1600 lands on exactly 50 with
+// nothing spare, and anything from 1634 up exceeds it outright — which would be
+// a deterministically dead graph tab for every free-plan brain that large, and
+// runGraphPass backfills edges nightly, so a brain arrives there on its own.
+//
+// 47 is the WARM figure. On a cold isolate the budget is shared with
+// initializeDatabase, which fires under waitUntil and spends about 12 more on
+// its DDL, so the first request against a fresh isolate costs ~59 and is over
+// the limit — 1500 buys margin on the warm path, it does not clear the cold one.
+// That is #282 (probe sqlite_master once instead of issuing twelve blind
+// statements, taking cold /graph from 59 to 48), not something a lower cap here
+// can fix: the tax is fixed, so it eats any N.
+//
+// Recompute the formula above before raising this, and count the cold case as
+// well as the warm one. D1's 5M rows/day cap is the secondary bound and is
+// nowhere near binding here; sizing against it is what produced a number that
+// broke the free plan.
+//
+// It is a legibility limit too: the packed-cluster canvas is unreadable well
+// before 1500 nodes.
+export const GRAPH_VIEW_MAX_NODES = 1500;
+
+/**
+ * Entries the pipeline wrote about itself rather than memories a person stored: the
+ * insight pass's proposals (and the auto-pattern finds it replaced) and the nightly
+ * compression's digests.
+ *
+ * Recall already excludes both (src/recall/search.ts) and the dashboard reviews
+ * them in a queue of their own, so the graph was the last surface drawing them as
+ * life events. Filtered here rather than in the client so the places they were
+ * occupying inside the node budget go to real memories instead.
+ *
+ * `rolled-up` and `duplicate-candidate` are deliberately absent: those mark a
+ * person's own memory, and it stays in the graph whatever the pipeline has since
+ * concluded about it.
+ */
+const MACHINE_AUTHORED_TAGS = new Set(["auto-pattern", "auto-insight", "synthesized"]);
 export const GRAPH_HOP_DECAY = 0.6;
 const EDGE_QUERY_BATCH = Math.floor(D1_MAX_BOUND_PARAMS / 2);
 
@@ -30,8 +76,9 @@ export async function expandGraph(
   seedIds: string[],
   opts: { hops: number; fanoutCap?: number; maxNodes?: number; includeDeprecated?: boolean },
   env: Env,
+  config: Readonly<Config> = DEFAULTS,
 ): Promise<GraphNeighbor[]> {
-  const hops = Math.max(0, Math.min(GRAPH_MAX_HOPS, opts.hops));
+  const hops = Math.max(0, Math.min(config.GRAPH_MAX_HOPS, opts.hops));
   if (hops === 0 || seedIds.length === 0) return [];
   const fanoutCap = opts.fanoutCap ?? GRAPH_FANOUT_CAP;
   const maxNodes = opts.maxNodes ?? GRAPH_MAX_NODES;
@@ -99,8 +146,8 @@ async function hydrateGraphEntries(ids: string[], env: Env): Promise<Map<string,
   return map;
 }
 
-export async function getConnections(id: string, type: string | undefined, env: Env): Promise<Connection[]> {
-  let neighbors = await expandGraph([id], { hops: 1 }, env);
+export async function getConnections(id: string, type: string | undefined, env: Env, config: Readonly<Config> = DEFAULTS): Promise<Connection[]> {
+  let neighbors = await expandGraph([id], { hops: 1 }, env, config);
   if (type) neighbors = neighbors.filter(n => n.viaType === type);
   if (!neighbors.length) return [];
 
@@ -125,19 +172,30 @@ export async function getConnections(id: string, type: string | undefined, env: 
   return out;
 }
 
-export async function buildGraph(opts: { seed?: string; limit?: number }, env: Env): Promise<GraphView> {
-  const limit = opts.limit && opts.limit > 0 ? opts.limit : Infinity;
+export async function buildGraph(opts: { seed?: string; limit?: number }, env: Env, config: Readonly<Config> = DEFAULTS): Promise<GraphView> {
+  // "No cap" resolves to GRAPH_VIEW_MAX_NODES, never to Infinity. Anything that
+  // is not a positive finite number — absent, 0, negative, NaN — takes that
+  // branch, so a caller who reaches here past the route's own validation still
+  // cannot ask for an unbounded result set. Keeping `limit` a finite integer is
+  // also what makes it safe to interpolate into the SQL below.
+  //
+  // The LIMIT bounds rows *returned*, not rows read: `weight` has no index, so
+  // SQLite full-scans and sorts `edges` either way and rows_read is unchanged.
+  // Bounding the result is still the point — it is what caps the node set, and
+  // the node set is what drives the query count above.
+  const asked = Number.isFinite(opts.limit) && (opts.limit as number) > 0
+    ? Math.floor(opts.limit as number)
+    : GRAPH_VIEW_MAX_NODES;
+  const limit = Math.min(asked, GRAPH_VIEW_MAX_NODES);
 
   let nodeIds: string[];
   if (opts.seed) {
-    const neighbors = await expandGraph([opts.seed], { hops: 2, maxNodes: limit, includeDeprecated: true }, env);
+    const neighbors = await expandGraph([opts.seed], { hops: 2, maxNodes: limit, includeDeprecated: true }, env, config);
     nodeIds = [opts.seed, ...neighbors.map(n => n.id)].slice(0, limit);
   } else {
-    const sql = Number.isFinite(limit)
-      ? `SELECT source_id, target_id FROM edges ORDER BY weight DESC LIMIT ${limit * 4}`
-      : `SELECT source_id, target_id FROM edges ORDER BY weight DESC`;
-    const { results } = await env.DB.prepare(sql)
-      .all() as { results: { source_id: string; target_id: string }[] };
+    const { results } = await env.DB.prepare(
+      `SELECT source_id, target_id FROM edges ORDER BY weight DESC LIMIT ${limit * 4}`
+    ).all() as { results: { source_id: string; target_id: string }[] };
     const ids: string[] = [];
     const seenIds = new Set<string>();
     for (const r of results) {
@@ -166,6 +224,7 @@ export async function buildGraph(opts: { seed?: string; limit?: number }, env: E
     const r = nodeRows.get(id);
     if (!r) continue;
     const tags: string[] = JSON.parse(r.tags ?? "[]");
+    if (tags.some(t => MACHINE_AUTHORED_TAGS.has(t))) continue;
     nodes.push({
       id,
       label: (r.content as string).slice(0, 80),

@@ -26,10 +26,16 @@ const DRY = !!process.env.DRY_RUN;
 const POLL_SECONDS = 10;
 const POLL_MAX_MINUTES = 45;
 
-const WORKER_SRC = resolve(ROOT, "src/index.ts");
+// Derived from one relative constant so the path and the error message cannot
+// drift apart again — SB_VERSION moved from src/index.ts to src/env.ts in the
+// v2.1 modularisation and this script kept pointing at the old file, which made
+// `deploy:worker` fail on every invocation.
+const WORKER_SRC_REL = "src/env.ts";
+const WORKER_SRC = resolve(ROOT, WORKER_SRC_REL);
 const APP_VERSION_FILES = {
   tauriConf: resolve(ROOT, "installer/src-tauri/tauri.conf.json"),
   installerPkg: resolve(ROOT, "installer/package.json"),
+  installerLock: resolve(ROOT, "installer/package-lock.json"),
   cargoToml: resolve(ROOT, "installer/src-tauri/Cargo.toml"),
 };
 
@@ -82,7 +88,7 @@ function readWorkerVersion() {
   const m = readFileSync(WORKER_SRC, "utf8").match(
     /export\s+const\s+SB_VERSION\s*=\s*["']([^"']+)["']/,
   );
-  if (!m) fail("couldn't find SB_VERSION in src/index.ts");
+  if (!m) fail(`couldn't find SB_VERSION in ${WORKER_SRC_REL}`);
   return m[1];
 }
 
@@ -108,6 +114,20 @@ function writeAppVersion(v) {
     json.version = v;
     writeFileSync(path, JSON.stringify(json, null, 2) + "\n");
   }
+  // package-lock.json carries the version twice — the top-level field and the
+  // root package entry — and npm treats a mismatch with package.json as an
+  // out-of-sync lockfile. Written here rather than by running `npm install`,
+  // which would also pull dependency churn into a release commit.
+  //
+  // This was missed until 1.3.1: every bump moved package.json and left the
+  // lockfile behind, so it sat two releases stale at 1.2.3 while the app shipped
+  // 1.3.1. Nothing failed loudly, which is why it survived — see the matching
+  // assertion in test/unit/version-consistency.test.ts.
+  const lock = JSON.parse(readFileSync(APP_VERSION_FILES.installerLock, "utf8"));
+  lock.version = v;
+  if (lock.packages?.[""]) lock.packages[""].version = v;
+  writeFileSync(APP_VERSION_FILES.installerLock, JSON.stringify(lock, null, 2) + "\n");
+
   const toml = readFileSync(APP_VERSION_FILES.cargoToml, "utf8");
   writeFileSync(
     APP_VERSION_FILES.cargoToml,
@@ -133,6 +153,28 @@ function writeAppVersion(v) {
 
 // ── git / gh ──────────────────────────────────────────────────────────────────
 
+/**
+ * Quote a string for the `/bin/sh` that `run()` shells out to.
+ *
+ * `JSON.stringify` was doing this job and is not safe for it. It escapes quotes
+ * and backslashes, which is what JSON needs, but leaves backticks, `$VAR` and
+ * `$(...)` untouched — and inside sh's *double* quotes all three still expand.
+ *
+ * The release that found this had a PR body reading "Bumps the app to 1.3.1 and
+ * `SB_VERSION` to 2.3.1". sh ran SB_VERSION as a command, printed
+ * "SB_VERSION: command not found" to stderr where nothing was watching, and
+ * substituted the empty result — so the PR shipped saying "and  to 2.3.1".
+ * Silent corruption of anything a release writes to GitHub, every time a
+ * backtick appears, which for a message naming a code symbol is most times.
+ *
+ * Single quotes are the fix rather than more escaping: sh expands nothing at all
+ * inside them. The one character that cannot appear is a single quote itself, so
+ * each is closed, escaped, and reopened.
+ */
+function sh(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
 function currentBranch() {
   return run("git rev-parse --abbrev-ref HEAD", { always: true });
 }
@@ -151,7 +193,7 @@ function assertReadyBranch() {
 
 function commitPush(message) {
   step(message);
-  run(`git commit -aqm ${JSON.stringify(message)}`);
+  run(`git commit -aqm ${sh(message)}`);
   run("git push -u origin HEAD", { stdio: "inherit" });
 }
 
@@ -175,11 +217,11 @@ function ensurePr(title, body) {
   }
   step("Opening PR to main");
   if (DRY) {
-    console.log(`  [dry-run] gh pr create --base main --title ${JSON.stringify(title)}`);
+    console.log(`  [dry-run] gh pr create --base main --title ${sh(title)}`);
     return 0;
   }
   run(
-    `gh pr create --base main --head ${branch} --title ${JSON.stringify(title)} --body ${JSON.stringify(body)}`,
+    `gh pr create --base main --head ${branch} --title ${sh(title)} --body ${sh(body)}`,
     { stdio: "inherit" },
   );
   const number = run(`gh pr view ${branch} --json number -q .number`, { always: true });

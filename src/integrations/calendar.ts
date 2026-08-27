@@ -3,10 +3,11 @@
  *
  * Read-only. Connects each provider's SECRET iCal subscription URL (Gmail's
  * "Secret address in iCal format", Outlook's published ICS link, iCloud's
- * shared webcal URL) — not CalDAV, not OAuth. One HTTPS GET per sync; ical.js
- * expands recurrences; qualifying occurrences mirror into memory. Upcoming
- * events are live-mirrored (cancellations delete); past events freeze into a
- * bounded historical log.
+ * shared webcal URL) — not CalDAV, not OAuth. One HTTPS GET per sync (two for
+ * iCloud published feeds when the `caldav` host misses and the `calendars`
+ * fallback is used); ical.js expands recurrences; qualifying occurrences
+ * mirror into memory. Upcoming events are live-mirrored (cancellations
+ * delete); past events freeze into a bounded historical log.
  */
 
 import ICAL from "ical.js";
@@ -29,7 +30,16 @@ export const RETENTION_MS = 180 * DAY_MS;    // hard bound on kept history
 // past, so they don't accumulate as low-value memories; one-off past events still
 // keep the full RETENTION_MS as historical memory.
 export const RECURRING_RETENTION_MS: number | null = 0;
-export const SYNC_EVENT_BATCH = 10;          // create/update ceiling per batch (subrequest budget)
+// Create/update ceiling per batch. The budget that binds here is D1's — 50
+// queries per Worker invocation on the free plan — not the one outbound fetch
+// per sync this used to be justified by, which is how the real cost went
+// unnoticed (#290). Each mirrored occurrence costs the mirror store two D1
+// queries to create (insert, then vector_ids) and three to update (read, content
+// write, vector_ids), on top of its classify, embed and Vectorize calls. So ten
+// items is 20–30 D1 queries: comfortable in an HTTP sync, which owns its whole
+// invocation, and the most the nightly cron can afford in the one it shares with
+// three other jobs (see CRON_SYNC_MAX_BATCHES in mirror.ts).
+export const SYNC_EVENT_BATCH = 10;
 export const MAX_OCCURRENCES_PER_EVENT = 200;
 const MAX_ITER = 100_000;                     // guards pathological RRULEs. Note: ev.iterator() walks from DTSTART, so this budget is also spent reaching the window; 100k covers realistic old/frequent series (e.g. hourly for ~10y, daily for centuries). Sub-hourly rules running many years may exhaust it and yield no occurrences — acceptable.
 const MAX_DESCRIPTION_CHARS = 4000;
@@ -52,6 +62,46 @@ export interface Occurrence {
 function cleanText(s: unknown): string {
   if (s == null) return "";
   return String(s).replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// Where a conferencing block starts.
+//
+// The calendar twin of the machine trailer in `integrations/email.ts`, and worse
+// in one respect: a recurring meeting carries the same block on every single
+// occurrence, so the identical text is embedded dozens of times over. It is pure
+// navigation — a join URL, a meeting id, a page of dial-in numbers — and says
+// nothing about what the meeting is for, which is the only thing a description
+// is worth remembering for.
+//
+// Anchored to a line start and matched on the organiser-generated wording, so a
+// description that merely says "join the pricing meeting" is left alone.
+const CONFERENCING_MARKERS = [
+  /\n[ \t]*_{10,}[ \t]*\n/,
+  /\n[ \t]*Join Zoom Meeting\b/i,
+  /\n[ \t]*Microsoft Teams meeting\b/i,
+  /\n[ \t]*Join with Google Meet\b/i,
+  /\n[ \t]*Join on your computer\b/i,
+  /\n[ \t]*Click here to join the meeting\b/i,
+  /\n[ \t]*One tap mobile\b/i,
+  /\n[ \t]*Dial by your location\b/i,
+  /\n[ \t]*Meeting ID:[ \t]/i,
+  /\n[ \t]*Find your local number\b/i,
+];
+
+/**
+ * Drop the conferencing block from an event description, keeping the agenda.
+ *
+ * Runs BEFORE the MAX_DESCRIPTION_CHARS cap, not after: a long block would
+ * otherwise spend the whole allowance on dial-in numbers and truncate away the
+ * agenda it was meant to preserve.
+ */
+export function stripConferencingBlock(description: string): string {
+  let t = (description || "").replace(/\r\n/g, "\n");
+  for (const re of CONFERENCING_MARKERS) {
+    const m = re.exec(t);
+    if (m && m.index > 0) t = t.slice(0, m.index);
+  }
+  return t.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function eventVersion(ev: any): string {
@@ -81,12 +131,63 @@ function pushSingle(ev: any, startMs: number, endMs: number, out: Occurrence[]):
     end: e,
     allDay: ev.startDate.isDate === true,
     location: cleanText(ev.location),
-    description: cleanText(ev.description).slice(0, MAX_DESCRIPTION_CHARS),
+    description: stripConferencingBlock(cleanText(ev.description)).slice(0, MAX_DESCRIPTION_CHARS),
     version: eventVersion(ev),
   });
 }
 
-function expandRecurring(ev: any, startMs: number, endMs: number, out: Occurrence[]): void {
+/**
+ * Slack added to every reach bound, to cover UTC-offset changes.
+ *
+ * The bound below is measured in absolute milliseconds, but ical.js builds an
+ * occurrence by adding the master's WALL-CLOCK duration in the occurrence's own
+ * timezone. Those two disagree across a DST transition, in both directions:
+ *
+ *  - A two-hour event whose end lands in a repeated hour takes THREE absolute
+ *    hours, so a bound measured off a master that spans no transition is short
+ *    by the offset change.
+ *  - A master whose own DTSTART/DTEND straddles a spring-forward gap measures
+ *    ONE absolute hour while being two on the wall — and since the master is
+ *    what the bound is derived from, that under-measurement would poison every
+ *    occurrence of the series forever, including ones nowhere near a transition.
+ *
+ * Reproducing ical.js's timezone arithmetic per occurrence would mean building
+ * the occurrence, which is the exact work the bound exists to avoid. A day of
+ * slack sidesteps it: every transition in current tzdata is an hour or less
+ * (Lord Howe's is thirty minutes), so this is not a close call. It costs almost
+ * nothing, because the bound is compared against a window that opens two days
+ * back — a year-old weekly series still rejects 51 of its 52 occurrences.
+ */
+const REACH_DST_SLACK_MS = DAY_MS;
+
+/**
+ * The furthest past its nominal start that an occurrence of this series can
+ * still be running — its longest possible (end − recurrence time), plus the
+ * slack above.
+ *
+ * This is what lets the walk below reject a spent occurrence from the iterator's
+ * own time, without building the occurrence first. It has to bound overrides as
+ * well as the master, because a RECURRENCE-ID instance can be both moved later
+ * and made longer; `end − recurrence-id` covers those two in one number. An
+ * override we cannot read returns Infinity, which disables the shortcut for this
+ * series rather than risking a wrong skip.
+ */
+function seriesReachMs(ev: any, exceptions: any[]): number {
+  let reach = ev.endDate.toJSDate().getTime() - ev.startDate.toJSDate().getTime();
+  for (const ex of exceptions) {
+    try {
+      const rid = ex.getFirstPropertyValue("recurrence-id");
+      if (!rid) continue;
+      const end = new ICAL.Event(ex).endDate.toJSDate().getTime();
+      reach = Math.max(reach, end - rid.toJSDate().getTime());
+    } catch {
+      return Infinity;
+    }
+  }
+  return Math.max(reach, 0) + REACH_DST_SLACK_MS;
+}
+
+function expandRecurring(ev: any, startMs: number, endMs: number, out: Occurrence[], reachMs: number): void {
   if (!ev.uid) return;
   const it = ev.iterator();
   let next: any;
@@ -96,6 +197,15 @@ function expandRecurring(ev: any, startMs: number, endMs: number, out: Occurrenc
     if (++iter > MAX_ITER) break;
     const occStartMs = next.toJSDate().getTime();
     if (occStartMs > endMs) break; // iterator is chronological — nothing further is in-window
+    // Cheap rejection before the expensive one. ev.iterator() walks from DTSTART,
+    // so on a series that has been running for a year the great majority of the
+    // occurrences visited here ended long before the window opens — measured at
+    // 91% for weekly series a year old, and getOccurrenceDetails is where
+    // essentially all of the expansion's CPU goes (#290). Deciding it from the
+    // iterator's own time skips building the occurrence at all. The reach bound
+    // is what keeps this exact for events still running when the window opens,
+    // including across a DST transition — see seriesReachMs.
+    if (occStartMs + reachMs < startMs) continue;
     const details = ev.getOccurrenceDetails(next);
     const e = details.endDate.toJSDate().getTime();
     if (e < startMs) continue;                 // occurrence already ended before window
@@ -112,18 +222,132 @@ function expandRecurring(ev: any, startMs: number, endMs: number, out: Occurrenc
       end: e,
       allDay: details.startDate.isDate === true,
       location: cleanText(details.item.location),
-      description: cleanText(details.item.description).slice(0, MAX_DESCRIPTION_CHARS),
+      description: stripConferencingBlock(cleanText(details.item.description)).slice(0, MAX_DESCRIPTION_CHARS),
       version: `${eventVersion(details.item)}::${startISO}`,
     });
     if (++emitted >= MAX_OCCURRENCES_PER_EVENT) break;
   }
 }
 
+/** Strip UTF-8 BOM and leading whitespace so BEGIN:VCALENDAR is findable. */
+function stripBom(text: string): string {
+  return text.replace(/^\uFEFF/, "").replace(/^\s+/, "");
+}
+
+function looksLikeIcs(text: string): boolean {
+  return /BEGIN:VCALENDAR/i.test(text);
+}
+
+/**
+ * Remove X-APPLE-STRUCTURED-LOCATION properties. Apple feeds often break RFC
+ * 5545 folding here (continuation lines without a leading space/tab), so we
+ * skip until the next real property / BEGIN / END line — not only space-folded
+ * continuations.
+ */
+function stripAppleStructuredLocation(ics: string): string {
+  const lines = ics.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const out: string[] = [];
+  let skipping = false;
+  const isNewContentLine = (line: string) =>
+    /^(BEGIN|END|[A-Za-z0-9-]+)[;:]/i.test(line);
+
+  for (const line of lines) {
+    if (skipping) {
+      if (line.startsWith(" ") || line.startsWith("\t")) continue;
+      if (!isNewContentLine(line)) continue; // orphan / broken fold
+      skipping = false;
+    }
+    if (/^X-APPLE-STRUCTURED-LOCATION/i.test(line)) {
+      skipping = true;
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\r\n");
+}
+
+/**
+ * Drop orphan content lines that have neither ':' nor ';' — typically Apple's
+ * non-indented continuations of X-APPLE-STRUCTURED-LOCATION after that property
+ * was already stripped, or leftover fragments that still break ical.js.
+ */
+function dropOrphanIcsLines(ics: string): string {
+  const lines = ics.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const out: string[] = [];
+  for (const line of lines) {
+    if (line === "") {
+      out.push(line);
+      continue;
+    }
+    // Folded continuations (space/tab) are valid; keep them for other properties.
+    if (line.startsWith(" ") || line.startsWith("\t")) {
+      out.push(line);
+      continue;
+    }
+    if (line.includes(":") || line.includes(";")) {
+      out.push(line);
+      continue;
+    }
+    // Orphan bare text — drop.
+  }
+  return out.join("\r\n");
+}
+
+/**
+ * Pick a VCALENDAR jCal root. ICAL.parse may return a single component or an
+ * array of roots when the input is odd; we always want the first vcalendar.
+ */
+function asVCalendarComponent(parsed: unknown): any {
+  if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === "string") {
+    // Single jCal component: ["vcalendar", [...], [...]]
+    return new ICAL.Component(parsed as any);
+  }
+  if (Array.isArray(parsed)) {
+    for (const item of parsed as any[]) {
+      if (Array.isArray(item) && item[0] === "vcalendar") {
+        return new ICAL.Component(item);
+      }
+    }
+    if (parsed.length > 0) return new ICAL.Component(parsed[0] as any);
+  }
+  return new ICAL.Component(parsed as any);
+}
+
+/**
+ * Sanitize Apple/iCloud ICS quirks then parse. Shared by connect validation and
+ * sync expansion so both paths see the same document.
+ */
+function parseIcsDocument(icsText: string): any {
+  let text = stripBom(icsText);
+  if (!looksLikeIcs(text)) {
+    throw new Error("NO_VCALENDAR");
+  }
+
+  const attempts = [
+    text,
+    stripAppleStructuredLocation(text),
+    dropOrphanIcsLines(stripAppleStructuredLocation(text)),
+  ];
+  // Deduplicate identical attempts.
+  const seen = new Set<string>();
+  let lastErr: unknown;
+  for (const attempt of attempts) {
+    if (seen.has(attempt)) continue;
+    seen.add(attempt);
+    try {
+      return asVCalendarComponent(ICAL.parse(attempt));
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
 // Parse an .ics document and expand it into concrete occurrences within
 // [windowStartMs, windowEndMs]. Registers embedded VTIMEZONEs so TZID-based
 // times resolve to the right absolute instants.
 export function parseAndExpand(icsText: string, windowStartMs: number, windowEndMs: number): Occurrence[] {
-  const root = new ICAL.Component(ICAL.parse(icsText));
+  const root = parseIcsDocument(icsText);
 
   for (const vtz of root.getAllSubcomponents("vtimezone")) {
     try {
@@ -153,8 +377,9 @@ export function parseAndExpand(icsText: string, windowStartMs: number, windowEnd
     try {
       if (g.master) {
         const ev = new ICAL.Event(g.master, { exceptions: g.exceptions });
-        if (ev.isRecurring()) expandRecurring(ev, windowStartMs, windowEndMs, out);
-        else pushSingle(ev, windowStartMs, windowEndMs, out);
+        if (ev.isRecurring()) {
+          expandRecurring(ev, windowStartMs, windowEndMs, out, seriesReachMs(ev, g.exceptions));
+        } else pushSingle(ev, windowStartMs, windowEndMs, out);
       } else {
         // No master in the feed (e.g. Google exports only the modified instances
         // of a series whose master is out of range): emit each override as a
@@ -255,6 +480,11 @@ export interface CalendarService {
   connectHint: string;
 }
 
+const ICS_FETCH_HEADERS = {
+  Accept: "text/calendar, text/plain, */*",
+  "User-Agent": "CalendarAgent/1.0 SecondBrain/2",
+};
+
 function normalizeUrl(raw: string): string {
   const swapped = raw.trim().replace(/^webcal:\/\//i, "https://");
   const u = new URL(swapped); // throws on garbage
@@ -262,10 +492,51 @@ function normalizeUrl(raw: string): string {
   return u.toString();
 }
 
+/** One-shot rewrite: pNN-caldav.icloud.com → pNN-calendars.icloud.com. */
+function icloudCalendarsFallbackUrl(url: string): string | null {
+  try {
+    const u = new URL(url);
+    const m = u.hostname.match(/^p(\d+)-caldav\.icloud\.com$/i);
+    if (!m) return null;
+    u.hostname = `p${m[1]}-calendars.icloud.com`;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function getIcsOnce(url: string): Promise<{ ok: boolean; status: number; body: string }> {
+  const res = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    headers: ICS_FETCH_HEADERS,
+  });
+  const body = stripBom(await res.text());
+  return { ok: res.ok, status: res.status, body };
+}
+
+/**
+ * Fetch a secret/public iCal URL. GET-only (Apple's published-calendar endpoint
+ * returns 400 to HEAD). Strips BOM before ICS detection. For iCloud caldav
+ * hosts, retries once on the calendars hostname if the first response is not a
+ * VCALENDAR. Returns the last 2xx body even when it is not ICS so callers can
+ * distinguish HTML from transport failure; throws only when no 2xx is obtained.
+ */
 async function fetchIcs(url: string): Promise<string> {
-  const res = await fetch(url, { headers: { Accept: "text/calendar" } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.text();
+  const first = await getIcsOnce(url);
+  if (first.ok && looksLikeIcs(first.body)) return first.body;
+
+  const fallback = icloudCalendarsFallbackUrl(url);
+  if (fallback) {
+    const second = await getIcsOnce(fallback);
+    if (second.ok && looksLikeIcs(second.body)) return second.body;
+    if (second.ok) return second.body;
+    if (first.ok) return first.body;
+    throw new Error(`HTTP ${second.status}`);
+  }
+
+  if (first.ok) return first.body;
+  throw new Error(`HTTP ${first.status}`);
 }
 
 // Validate a pasted secret iCal URL and return a display label for the UI.
@@ -280,8 +551,14 @@ export async function validateCalendarUrl(rawUrl: string): Promise<string> {
   }
   let root: any;
   try {
-    root = new ICAL.Component(ICAL.parse(body));
-  } catch {
+    root = parseIcsDocument(body);
+  } catch (e) {
+    if (e instanceof Error && e.message === "NO_VCALENDAR") {
+      throw new Error("That link didn't return a calendar. Make sure it's the secret iCal (.ics) address, not the calendar's web page.");
+    }
+    if (looksLikeIcs(stripBom(body))) {
+      throw new Error("That link returned a calendar that couldn't be parsed. Try regenerating the public calendar link in iCloud.");
+    }
     throw new Error("That link didn't return a calendar. Make sure it's the secret iCal (.ics) address, not the calendar's web page.");
   }
   if (root.name !== "vcalendar") {

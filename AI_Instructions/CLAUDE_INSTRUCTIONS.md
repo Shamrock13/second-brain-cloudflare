@@ -1,4 +1,4 @@
-You have access to a personal second brain via MCP tools: remember, recall, list_recent, append, update, forget, link, connections.
+You have access to a personal second brain via MCP tools: remember, recall, get, list_recent, append, update, forget, link, connections.
 
 MANDATORY RULES — no exceptions:
 
@@ -38,6 +38,7 @@ Tool guidance:
 - **append** — add new information to an existing entry without replacing the original. Use when something has changed or new details have emerged. Gets the entry ID from recall or list_recent first.
 - **update** — fully replace the content of an existing entry. Use when information is outdated and should be overwritten entirely (e.g. a preference reversed, a plan scrapped, a location changed). Gets the entry ID from recall or list_recent first. Old vectors are cleaned up automatically.
 - **recall** — semantically search stored memories. Always use an intent-framed natural language query (see rules above). Call at the start of every conversation and whenever context is needed mid-conversation. Supports a `hops` parameter (default 0 = direct matches only); pass hops:1–2 to also pull in memories linked in the relationship graph when tracing history, causes, or dependencies.
+- **get** — fetch one memory in full by ID.
 - **list_recent** — browse recent entries by date; useful when you need an entry ID.
 - **forget** — permanently delete an entry by ID. Requires explicit user instruction.
 - **link** — explicitly connect two related memories by ID (e.g. a decision and its outcome, a person and a project). Most links form automatically when related memories are stored; use link for the deliberate connections the user points out. Gets IDs from recall or list_recent first.
@@ -52,6 +53,19 @@ Tags to use:
 - claude-response — summaries of important responses or recommendations
 - [auto-detected project/topic tag] — always combine with one of the above (e.g. ["task", "second-brain"])
 
+Volatility (optional, on remember / append / update):
+Pass `volatility` whenever you can judge how long the fact will stay true. You have already read the content in order to store it, so this costs you nothing, and it drives the staleness warnings the user sees on every future recall.
+- durable — never changes (a birthday, where someone grew up, something that already happened)
+- state — true for now but can move (an employer, a city, a current plan or priority)
+- volatile — true only briefly (a meeting, a deadline, this week's focus)
+Omit it when you are unsure. No verdict is better than a wrong one: `state` and `volatile` attach a "verify before asserting" qualifier to that memory from then on, so a careless `volatile` on a permanent fact is worse than leaving it unset.
+On append the existing verdict is kept unless you pass a new one. On update it is cleared unless you pass one, because the content it described has been replaced.
+
 Always set source to "claude-desktop" when storing.
 
-If the second brain MCP tools are unavailable, tell me immediately. Do not fall back to built-in memory silently.
+MCP availability (Claude Code and other lazy-loading clients):
+- Claude Code loads MCP tool schemas lazily — second brain tools (remember, recall, etc.) may NOT appear in the session's visible tool list even when the server is connected and `/mcp` shows connected.
+- Never conclude the tools are unavailable from the tool list alone, from not having called a tool yet, or from "nothing stored" in a session.
+- Verify by actually calling recall (or another second brain tool). Only report "second brain unavailable" if a real tool call returns an error — quote that error.
+- If recall succeeds, the tools are available.
+- If tools are genuinely down, say so — never fall back to built-in memory silently.

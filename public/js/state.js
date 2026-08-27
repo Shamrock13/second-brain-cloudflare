@@ -1,0 +1,17 @@
+let WORKER_URL = '',
+  AUTH_TOKEN = '',
+  allEntries = []
+let pendingForgetId = null,
+  pendingAppendId = null,
+  pendingForgetCard = null
+let currentTab = 'home',
+  selectedTag = '',
+  selectedTimeRange = ''
+/** 'list' | 'graph' — which projection of the corpus the Memories screen shows. */
+let memoryView = 'list'
+let currentCount = 0
+let vectorizeGraceMs = 300000
+let pendingEditId = null
+let integrationsInfo = []
+let currentCategory = null
+let graphState = null

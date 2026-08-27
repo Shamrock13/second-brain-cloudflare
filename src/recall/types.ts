@@ -1,14 +1,23 @@
 import type { EdgeProvenance, EdgeType } from "../graph/types";
+import type { EmbeddingQueryMode } from "./query-profile";
+import type { RootView } from "./root-selector";
+
+export interface CompoundStaleSignal {
+  count: number;
+  oldestUpdatedAt: number;
+}
 
 export interface RecallMatch {
   id: string;
   content: string;
   score: number;
   createdAt: number;
+  updatedAt: number;
   tags: string[];
   source: string;
   isUpdate: boolean;
   hop: number;
+  staleAsOf?: boolean;
   // Set only on graph-expanded matches (hop > 0): why / when / whence the edge that surfaced this memory.
   viaProvenance?: EdgeProvenance; // "explicit" (you linked) / "inferred" (auto) / "system"
   viaType?: EdgeType;
@@ -24,6 +33,43 @@ export interface RecallSearchResult {
   // Distilled query terms, reused to pick a query-relevant excerpt when a long
   // memory has to be shortened for the response.
   queryTokens?: string[];
+  compoundStale?: CompoundStaleSignal;
+}
+
+export interface RecallDiagnostics {
+  embeddingMode?: EmbeddingQueryMode;
+  denseIds?: string[];
+  keywordIds?: string[];
+  candidateIds?: string[];
+  fusedIds?: string[];
+  rootSelections?: { id: string; selectedBy: RootView }[];
+  expandedIds?: string[];
+  eligibleRelatedIds?: string[];
+  selectedRelatedIds?: string[];
+  finalIds?: string[];
+  rejections?: { id: string; reason: string }[];
+  operations?: RecallOperationDiagnostics;
+  stageMs?: Partial<Record<RecallStage, number>>;
+}
+
+export type RecallStage = "setup" | "querySignals" | "candidateGeneration" | "candidateHydration"
+  | "graphExpansion" | "finalHydration" | "selection" | "synthesis" | "total";
+
+export interface RecallOperationDiagnostics {
+  aiCalls: number;
+  embeddingCalls: number;
+  vectorizeQueries: number;
+  vectorizeGets: number;
+  d1Statements: number;
+  d1RowsRead: number | null;
+  d1RowsWritten: number | null;
+  kvReads: number;
+  kvWrites: number;
+}
+
+export interface RecallInternalOptions {
+  embeddingQueryMode?: EmbeddingQueryMode;
+  diagnostics?: RecallDiagnostics;
 }
 
 export interface KeywordRow {

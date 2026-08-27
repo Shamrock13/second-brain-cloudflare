@@ -1,8 +1,9 @@
 import type { Env } from "../env";
-import { json, requireAuth } from "../lib/http";
+import { intParam, json, requireAuth } from "../lib/http";
 import { createEdge, deleteEdge, isValidEdgeType } from "../graph/edges";
 import { EDGE_TYPES } from "../graph/types";
 import { buildGraph, getConnections } from "../graph/traverse";
+import { resolveConfig } from "../config";
 
 export async function handleGraphRoutes(
   request: Request,
@@ -60,7 +61,7 @@ export async function handleGraphRoutes(
     if (!id) return json({ ok: false, error: "id is required" }, 400);
     const type = url.searchParams.get("type")?.trim() || undefined;
 
-    const connections = await getConnections(id, type, env);
+    const connections = await getConnections(id, type, env, await resolveConfig(env));
     return json({ ok: true, id, connections });
   }
 
@@ -71,10 +72,12 @@ export async function handleGraphRoutes(
     if (authErr) return authErr;
 
     const seed = url.searchParams.get("seed")?.trim() || undefined;
-    const limitParam = url.searchParams.get("limit");
-    const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+    // Omitted still means the whole graph, up to buildGraph's own ceiling. The
+    // floor of 1 is what stops `?limit=0` and `?limit=-1` from meaning that too.
+    const limit = intParam(url, "limit", { min: 1 });
+    if (limit instanceof Response) return limit;
 
-    const { nodes, edges } = await buildGraph({ seed, limit }, env);
+    const { nodes, edges } = await buildGraph({ seed, limit }, env, await resolveConfig(env));
     return json({ ok: true, nodes, edges });
   }
 

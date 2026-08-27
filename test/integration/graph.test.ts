@@ -4,6 +4,7 @@ import { makeTestEnv, makeTestDb } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
 import type { Env } from "../../src/env";
 import { D1Mock } from "../helpers/d1-mock";
+import { createEdge } from "../../src/graph/edges";
 
 const ctx = { waitUntil: (_: Promise<any>) => {} } as any;
 
@@ -46,6 +47,28 @@ describe("GET /graph", () => {
     expect(data.edges).toEqual([{ source: "a", target: "b", type: "relates_to", weight: 0.7, provenance: "inferred" }]);
   });
 
+  it("leaves machine-authored entries out of the graph", async () => {
+    // auto-pattern, auto-insight and synthesized entries are written by the pattern-mining
+    // (now insight) and compression passes — the brain's notes about itself. Recall
+    // already excludes them and the dashboard reviews them in their own queue.
+    seedEntry(db, "e1", "A memory", ["cycling"]);
+    seedEntry(db, "e2", "A mined pattern", ["auto-pattern"]);
+    seedEntry(db, "e3", "A nightly digest", ["synthesized"]);
+    // rolled-up marks the person's own memory as folded into a digest; it stays.
+    seedEntry(db, "e4", "A folded memory", ["cycling", "rolled-up"]);
+    seedEntry(db, "e5", "A proposed insight", ["auto-insight"]);
+    // all five are edged, so exclusion has to come from the tag rather than from
+    // having nothing to attach to
+    pushEdge(db, "e1", "e2");
+    pushEdge(db, "e2", "e3");
+    pushEdge(db, "e1", "e4");
+    pushEdge(db, "e1", "e5");
+
+    const res = await worker.fetch(req("GET", "/graph"), env, ctx);
+    const data = await res.json() as any;
+    expect(data.nodes.map((n: any) => n.id).sort()).toEqual(["e1", "e4"]);
+  });
+
   it("never returns dangling edges (an endpoint missing from the node set)", async () => {
     seedEntry(db, "a", "Memory A");
     seedEntry(db, "b", "Memory B");
@@ -81,6 +104,22 @@ describe("GET /graph", () => {
     const data = await res.json() as any;
     expect(data.nodes).toHaveLength(250);
     expect(data.edges).toHaveLength(249);
+  });
+
+  it("returns a drawn_from edge from the graph read", async () => {
+    // Inserted through createEdge — the validated path a writer actually uses —
+    // rather than the raw pushEdge fixture: pushEdge writes straight into
+    // db.edges with no type check, so it would show the edge in the read
+    // whether or not drawn_from is registered and prove nothing about the
+    // registry entry this type depends on.
+    seedEntry(db, "i1", "An insight", ["work"]);
+    seedEntry(db, "m1", "A source memory", ["work"]);
+    const created = await createEdge("i1", "m1", "drawn_from", { provenance: "system" }, env);
+    expect(created).not.toBeNull();
+
+    const res = await worker.fetch(req("GET", "/graph"), env, ctx);
+    const data = await res.json() as any;
+    expect(data.edges.some((e: any) => e.type === "drawn_from")).toBe(true);
   });
 
   it("still honors an explicit ?limit=", async () => {

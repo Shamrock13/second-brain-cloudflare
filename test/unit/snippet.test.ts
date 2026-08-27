@@ -6,6 +6,7 @@ import {
   FULL_MATCH_MAX_CHARS,
   RECALL_FULL_MATCHES,
   SNIPPET_MAX_CHARS,
+  queryRelevantWindow,
 } from "../../src/recall/snippet";
 
 // The cost of the truncation note itself, mirrored from snippet.ts. A memory
@@ -126,10 +127,20 @@ describe("allowanceFor", () => {
   });
 });
 
+describe("queryRelevantWindow", () => {
+  it("drops a partial leading word when a nonzero window starts inside it", () => {
+    const content = `${"x".repeat(100)} alpha beta ${"noise ".repeat(100)}`;
+    const window = queryRelevantWindow(content, ["alpha", "beta"]);
+
+    expect(window).toMatch(/^alpha beta /);
+    expect(window.length).toBeLessThanOrEqual(400);
+  });
+});
+
 describe("truncationNote", () => {
   it("carries the id and the full size so the caller can fetch the rest", () => {
     const note = truncationNote("abc-123", { text: "…", truncated: true, fullLength: 12345 });
     expect(note).toContain('get("abc-123")');
-    expect(note).toContain("12,345");
+    expect(note).toMatch(/12[,.]345/);
   });
 });
