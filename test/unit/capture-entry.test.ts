@@ -223,6 +223,7 @@ describe("captureEntry()", () => {
     if (result.status !== "contradiction_protected") return;
     expect(result.id).toBeDefined();
     expect(result.canonicalId).toBe("canonical-entry");
+    expect(result.entryStatus).toBe("draft");
     expect(result.reason).toBe("different city");
 
     // Canonical entry is UNCHANGED
@@ -623,5 +624,156 @@ describe("captureEntry()", () => {
     const result = await captureEntry("Note with broken vectorize", [], "api", env, ctx);
     expect(result.status).toBe("stored");
     expect(db.entries).toHaveLength(1);
+  });
+
+  // ── Transcript sources (PR B, #327) ─────────────────────────────────────────
+
+  const existingNote = (source: string, importance = 3) => ({
+    id: "existing", content: "We decided to use Vectorize for semantic search.", tags: '["work"]', source,
+    created_at: Date.now(), vector_ids: '["existing-vec"]', recall_count: 0, importance_score: importance,
+  });
+  const nearMatch = () => makeVectorizeMock({
+    query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.9, metadata: { parentId: "existing" } }] }),
+  });
+
+  it("a transcript never replaces a memory of another source — both rows survive, newcomer is a duplicate-candidate with a real id", async () => {
+    db.entries = [existingNote("claude")];
+    env = makeTestEnv(db, { VECTORIZE: nearMatch(), AI: makeContradictionAI('{"action":"replace","target_id":"existing"}') });
+    const { ctx } = makeCtx();
+    const result = await captureEntry("User: we decided on Vectorize.\n\nAssistant: noted.", ["proj"], "claude-code", env, ctx);
+    expect(result.status).toBe("flagged");
+    if (result.status !== "flagged") return;
+    expect(db.entries).toHaveLength(2);
+    expect(db.entries.find(e => e.id === "existing")!.content).toBe("We decided to use Vectorize for semantic search.");
+    const added = db.entries.find(e => e.id === result.id);
+    expect(added, "returned id must be a stored row").toBeDefined();
+    expect(JSON.parse(added!.tags)).toContain("duplicate-candidate");
+  });
+
+  it("a transcript may replace its own earlier capture (same source)", async () => {
+    db.entries = [existingNote("claude-code")];
+    env = makeTestEnv(db, { VECTORIZE: nearMatch(), AI: makeContradictionAI('{"action":"replace","target_id":"existing"}') });
+    const { ctx } = makeCtx();
+    const result = await captureEntry("User: longer tail of the same session.", [], "claude-code", env, ctx);
+    expect(result.status).toBe("replaced");
+    expect(db.entries).toHaveLength(1);
+  });
+
+  // The block threshold sits above the merge branch and must stay there: a
+  // transcript that is byte-for-byte what is already stored is still dropped,
+  // not stored a second time because of the guard below it.
+  it("a transcript identical to an existing memory is still blocked", async () => {
+    db.entries = [existingNote("claude")];
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.97, metadata: { parentId: "existing" } }] }),
+      }),
+      AI: makeContradictionAI('{"action":"replace","target_id":"existing"}'),
+    });
+    const { ctx } = makeCtx();
+    const result = await captureEntry("We decided to use Vectorize for semantic search.", [], "claude-code", env, ctx);
+    expect(result.status).toBe("blocked");
+    expect(db.entries).toHaveLength(1);
+  });
+
+  it("a protected target (importance >= 4) no longer produces a phantom id: the newcomer is stored", async () => {
+    db.entries = [existingNote("api", 4)];
+    env = makeTestEnv(db, { VECTORIZE: nearMatch(), AI: makeContradictionAI('{"action":"merge","target_id":"existing","merged_content":"merged"}') });
+    const { ctx } = makeCtx();
+    const result = await captureEntry("A near duplicate written by hand.", [], "api", env, ctx);
+    expect(result.status).toBe("flagged");
+    if (result.status !== "flagged") return;
+    expect(db.entries.map(e => e.id)).toContain(result.id);
+    expect(db.entries.find(e => e.id === "existing")!.content).toBe("We decided to use Vectorize for semantic search.");
+  });
+
+  it("a transcript that contradicts another source's memory becomes a draft and deprecates nothing", async () => {
+    db.entries = [existingNote("claude")];
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.7, metadata: { parentId: "existing" } }] }) }),
+      AI: makeContradictionAI('{"contradicts": true, "conflicting_id": "existing", "reason": "reversed decision"}'),
+    });
+    const { ctx } = makeCtx();
+    const result = await captureEntry("User: actually let's not use Vectorize.\n\nAssistant: understood.", [], "claude-code", env, ctx);
+    expect(result.status).toBe("contradiction_protected");
+    const existing = db.entries.find(e => e.id === "existing")!;
+    expect(JSON.parse(existing.tags)).not.toContain("status:deprecated");
+    expect(existing.vector_ids).toBe('["existing-vec"]');
+    expect((env.VECTORIZE.deleteByIds as any)).not.toHaveBeenCalled();
+    const added = db.entries.find(e => e.id !== "existing")!;
+    expect(JSON.parse(added.tags)).toContain("status:draft");
+  });
+
+  it("a hand-written contradiction still deprecates (unchanged behaviour)", async () => {
+    db.entries = [existingNote("claude")];
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({ query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.7, metadata: { parentId: "existing" } }] }) }),
+      AI: makeContradictionAI('{"contradicts": true, "conflicting_id": "existing", "reason": "reversed decision"}'),
+    });
+    const { ctx } = makeCtx();
+    const result = await captureEntry("We moved off Vectorize to a KV index.", [], "claude", env, ctx);
+    expect(result.status).toBe("contradiction");
+    expect(JSON.parse(db.entries.find(e => e.id === "existing")!.tags)).toContain("status:deprecated");
+  });
+
+  // ── Prompt Capsule definitions (#329) ───────────────────────────────────────
+
+  const capsuleTags = ["capsule:core", "capsule-slot:identity", "status:canonical"];
+
+  it("a capsule-tagged capture judged a mergeable duplicate is stored as its own row with its tags intact", async () => {
+    db.entries = [existingNote("api", 2)];
+    env = makeTestEnv(db, {
+      VECTORIZE: nearMatch(),
+      AI: makeContradictionAI('{"action":"merge","target_id":"existing","merged_content":"merged"}'),
+    });
+    const { ctx } = makeCtx();
+    const result = await captureEntry("The user prefers concise answers.", capsuleTags, "api", env, ctx);
+    expect(result.status).toBe("flagged");
+    if (result.status !== "flagged") return;
+    expect(db.entries).toHaveLength(2);
+    expect(db.entries.find(e => e.id === "existing")!.content).toBe("We decided to use Vectorize for semantic search.");
+    const tags: string[] = JSON.parse(db.entries.find(e => e.id === result.id)!.tags);
+    expect(tags).toEqual(expect.arrayContaining(capsuleTags));
+  });
+
+  it("a capsule-tagged capture judged a contradiction is demoted to draft", async () => {
+    db.entries = [{ ...existingNote("api"), tags: '["status:canonical"]' }];
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.7, metadata: { parentId: "existing" } }] }),
+      }),
+      AI: makeContradictionAI('{"contradicts": true, "conflicting_id": "existing", "reason": "reversed decision"}'),
+    });
+    let insertedTags = "";
+    const originalPush = db.entries.push.bind(db.entries);
+    vi.spyOn(db.entries, "push").mockImplementation((...rows) => {
+      insertedTags = rows[0].tags;
+      return originalPush(...rows);
+    });
+    const { ctx } = makeCtx();
+    const result = await captureEntry("We use keyword search only.", capsuleTags, "api", env, ctx);
+    expect(JSON.parse(insertedTags)).toContain("status:draft");
+    expect(result.status).toBe("contradiction_protected");
+    if (result.status !== "contradiction_protected") return;
+    expect(result.entryStatus).toBe("draft");
+    const tags: string[] = JSON.parse(db.entries.find(e => e.id === result.id)!.tags);
+    expect(tags).not.toContain("status:canonical");
+    expect(tags).toContain("status:draft");
+    expect(tags).not.toContain("contradiction-resolved");
+    expect(JSON.parse(db.entries.find(e => e.id === "existing")!.tags)).toContain("status:canonical");
+  });
+
+  it("an exact duplicate capsule definition is stored with its own tags", async () => {
+    db.entries = [existingNote("api")];
+    env = makeTestEnv(db, {
+      VECTORIZE: makeVectorizeMock({
+        query: vi.fn().mockResolvedValue({ matches: [{ id: "existing", score: 0.97, metadata: { parentId: "existing" } }] }),
+      }),
+    });
+    const { ctx } = makeCtx();
+    const result = await captureEntry("We decided to use Vectorize for semantic search.", capsuleTags, "api", env, ctx);
+    expect(result.status).toBe("stored");
+    expect(db.entries).toHaveLength(2)
+    expect(JSON.parse(db.entries[1].tags)).toEqual(expect.arrayContaining(capsuleTags));
   });
 });

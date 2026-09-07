@@ -40,6 +40,11 @@ class SqliteStatement {
     return new SqliteStatement(this.db, this.sql, args);
   }
 
+  /** SQL text retained so batch-aware assertions can inspect its members. */
+  sourceSql(): string {
+    return this.sql;
+  }
+
   async all(): Promise<{ results: unknown[]; success: true; meta: { rows_written: 0 } }> {
     const rows = this.db.prepare(this.sql).all(...(this.args as never[]));
     // SQLite can prove that this SELECT wrote no rows, but it cannot reproduce
@@ -53,8 +58,23 @@ class SqliteStatement {
     return row ?? null;
   }
 
-  async run(): Promise<{ success: true; meta: { rows_written: number } }> {
-    const result = this.db.prepare(this.sql).run(...(this.args as never[]));
+  /**
+   * D1 returns each batched statement's ROWS as well as its meta, and a batch
+   * carries reads as well as writes — identity resolution pairs its SELECT with
+   * the throttled last_used_at write so the pair costs one subrequest. batch()
+   * below executes statements through run(), and several tests wrap batch() with
+   * their own `st.run()` loop, so a SELECT has to answer with its rows here or
+   * the identity read comes back empty through every one of them.
+   *
+   * Additive for writes: `meta.rows_written` is unchanged, and `results` is
+   * simply absent where there are no rows to report.
+   */
+  async run(): Promise<{ results?: unknown[]; success: true; meta: { rows_written: number } }> {
+    const statement = this.db.prepare(this.sql);
+    if (/^\s*(SELECT|WITH)\b/i.test(this.sql)) {
+      return { results: statement.all(...(this.args as never[])), success: true, meta: { rows_written: 0 } };
+    }
+    const result = statement.run(...(this.args as never[]));
     return { success: true, meta: { rows_written: Number(result.changes) } };
   }
 }
@@ -64,13 +84,15 @@ export interface SqliteD1 {
   db: {
     prepare(sql: string): SqliteStatement;
     exec(sql: string): Promise<void>;
-    batch(statements: SqliteStatement[]): Promise<{ success: true; meta: { rows_written: number } }[]>;
+    batch(statements: SqliteStatement[]): Promise<{ results?: unknown[]; success: true; meta: { rows_written: number } }[]>;
   };
   /**
    * One entry per D1 call made through `db` — which is one entry per subrequest,
    * since `prepare()` here is only ever followed by a single execution.
    */
   issued: string[];
+  /** SQL members of each collapsed batch, without changing its one-subrequest count. */
+  batches: string[][];
   /** Column names currently on `entries`, straight from SQLite. */
   columns(): string[];
   /** Insert an entry directly, bypassing the capture pipeline. */
@@ -96,36 +118,88 @@ export interface SqliteD1 {
  * column rename breaks these tests, which is the point — the migration's SQL
  * names columns.
  */
+/**
+ * Remove `-- …` line comments, respecting single-quoted string literals so a
+ * "--" inside a default value is not mistaken for a comment.
+ */
+function stripSqlComments(sql: string): string {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    if (inString) {
+      out += ch;
+      if (ch === "'") inString = false;
+      continue;
+    }
+    if (ch === "'") {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "-" && sql[i + 1] === "-") {
+      // Skip to end of line, keeping the newline so line structure survives.
+      while (i < sql.length && sql[i] !== "\n") i++;
+      out += "\n";
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/** Split top-level schema statements without cutting semicolons inside triggers. */
+function splitSchemaStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let current = "";
+  let trigger = false;
+  for (const ch of sql) {
+    current += ch;
+    if (!trigger && /^\s*CREATE\s+TRIGGER\b/i.test(current)) trigger = true;
+    if (ch !== ";") continue;
+    if (trigger && !/\bEND\s*;\s*$/i.test(current)) continue;
+    statements.push(current.slice(0, -1));
+    current = "";
+    trigger = false;
+  }
+  if (current.trim()) statements.push(current);
+  return statements;
+}
+
 export function makeSqliteD1({ schema: applySchema = true }: { schema?: boolean } = {}): SqliteD1 {
   const raw = new DatabaseSync(":memory:");
   // The schema uses D1-flavoured DDL; execute it statement by statement so one
   // unsupported pragma cannot take the whole file down silently.
   const schema = applySchema ? readFileSync(SCHEMA, "utf8") : "";
-  for (const statement of schema.split(";")) {
-    // Strip comment lines rather than skipping any chunk that starts with one:
-    // splitting on ";" leaves the preceding comment attached to the statement
-    // after it, so a "starts with --" test silently drops real DDL.
-    const sql = statement
-      .split("\n")
-      .filter(line => !line.trim().startsWith("--"))
-      .join("\n")
-      .trim();
+  // Strip comments BEFORE splitting, not after. Splitting the raw file on ";"
+  // and filtering comment lines out of each chunk looks equivalent but is not:
+  // a ";" inside a trailing `-- comment` cuts the statement it is attached to
+  // in half, and the two halves then fail to parse. Wrangler's own splitter is
+  // comment-aware, so such a file migrates fine in production while silently
+  // losing tables here — which is exactly how the whole `users` table (and with
+  // it every tenancy test) went missing without a single red test.
+  for (const statement of splitSchemaStatements(stripSqlComments(schema))) {
+    const sql = statement.trim();
     if (!sql) continue;
     try {
       raw.exec(sql);
     } catch (e) {
-      // Indexes on tables this facade does not need, or D1-only syntax. Fail
-      // loudly for anything touching `entries`, which the migration reads.
-      if (/\bentries\b/i.test(sql)) {
+      // A CREATE TABLE that does not apply leaves tests asserting against a
+      // database that is missing the thing under test, so no table creation is
+      // ever allowed to fail quietly. Indexes are the tolerated case: some use
+      // D1-only syntax this facade does not need.
+      if (/^\s*CREATE\s+TABLE\b/i.test(sql) || /\bentries\b/i.test(sql)) {
         throw new Error(`schema.sql statement failed:\n${sql}\n${String(e)}`);
       }
     }
   }
 
   const issued: string[] = [];
+  const batches: string[][] = [];
 
   return {
     issued,
+    batches,
     db: {
       prepare: (sql: string) => {
         issued.push(sql);
@@ -149,7 +223,16 @@ export function makeSqliteD1({ schema: applySchema = true }: { schema?: boolean 
       // they are replaced by the single entry the platform actually charges for.
       batch: async (statements: SqliteStatement[]) => {
         issued.splice(Math.max(0, issued.length - statements.length), statements.length, "BATCH");
-        const out: { success: true; meta: { rows_written: number } }[] = [];
+        // Some tests wrap a prepared statement to instrument run(). Preserve
+        // compatibility with those D1-shaped wrappers while retaining SQL when
+        // either the wrapper or its conventional __inner statement exposes it.
+        batches.push(statements.map((statement) => {
+          const wrapped = statement as SqliteStatement & { __inner?: SqliteStatement };
+          if (typeof wrapped.sourceSql === "function") return wrapped.sourceSql();
+          if (typeof wrapped.__inner?.sourceSql === "function") return wrapped.__inner.sourceSql();
+          return "[wrapped D1 statement]";
+        }));
+        const out: { results?: unknown[]; success: true; meta: { rows_written: number } }[] = [];
         for (const statement of statements) out.push(await statement.run());
         return out;
       },
