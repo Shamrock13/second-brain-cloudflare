@@ -34,6 +34,22 @@ function onGraphLayerChange(value) {
   loadGraph()
 }
 
+/**
+ * /graph nodes carry actor_name, never actor_id (src/graph/types.ts), the
+ * same resolved display string GET /list and GET /recall already print.
+ * #actor-filter-recent's options hold ids (loadMemoryAuthors/renderAuthorOptions
+ * in recent.js), so the selected id has to be mapped through the loaded
+ * roster to that same name before it can match a node. The caller's own row
+ * resolves to the literal "You" the server also uses (untranslated by
+ * design, see src/lib/actors.ts), not the translated option label.
+ */
+function actorNameForGraphFilter(actorId) {
+  if (typeof memoryAuthors === 'undefined' || !memoryAuthors) return null
+  if (actorId === memoryAuthors.you) return 'You'
+  const member = (memoryAuthors.members || []).find((m) => m.userId === actorId)
+  return member ? member.name : null
+}
+
 async function loadGraph() {
   maybeRevealGraphLayer()
   const canvas = document.getElementById('graph-canvas')
@@ -42,6 +58,11 @@ async function loadGraph() {
   try {
     const res = await fetch(`${WORKER_URL}/graph${graphLayerFilter ? `?workspace=${encodeURIComponent(graphLayerFilter)}` : ''}`, { headers: { Authorization: `Bearer ${AUTH_TOKEN}` } })
     const data = await res.json()
+    if (typeof memoryActorFilter !== 'undefined' && memoryActorFilter && Array.isArray(data.nodes)) {
+      const filtered = filterGraphByActor(data.nodes, data.edges, actorNameForGraphFilter(memoryActorFilter))
+      data.nodes = filtered.nodes
+      data.edges = filtered.edges
+    }
     if (!data.ok || !data.nodes || !data.nodes.length) {
       graphState = null
       canvas.style.display = 'none'
@@ -98,6 +119,9 @@ function initGraphSim(canvas, nodes, edges) {
     for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0
     return `hsl(${h % 360}, 45%, 52%)`
   }
+  // A project's cluster is named by the project; every other cluster by its tag.
+  const projectClusters = new Set(nodes.map((n) => projectTagsOf(n.tags)[0]).filter(Boolean))
+  const clusterLabel = (id) => (projectClusters.has(id) && typeof projectName === 'function' ? projectName(id) : id)
   const clusterColor = new Map()
   const clusterLegend = []
   {
@@ -113,7 +137,7 @@ function initGraphSim(canvas, nodes, edges) {
     ordered.forEach((id) => {
       const color = id === LOOSE_CLUSTER ? LOOSE_COLOR : pi < CLUSTER_PALETTE.length ? CLUSTER_PALETTE[pi++] : clusterHue(id)
       clusterColor.set(id, color)
-      if (id !== LOOSE_CLUSTER) clusterLegend.push({ label: id, color, count: sz.get(id) })
+      if (id !== LOOSE_CLUSTER) clusterLegend.push({ label: clusterLabel(id), color, count: sz.get(id) })
     })
   }
   for (const n of nodes) n.clusterColor = clusterColor.get(n.cluster)
@@ -172,7 +196,7 @@ function initGraphSim(canvas, nodes, edges) {
         n.olx = c.x
         n.oly = c.y
       })
-      outerObjs.push({ id, color, label: id, subs, loose, R: packed.R + 9 })
+      outerObjs.push({ id, color, label: clusterLabel(id), subs, loose, R: packed.R + 9 })
     }
     // pack the category discs on the canvas (largest first)
     const outerPacked = packGraphCircles(

@@ -8,7 +8,7 @@ Incremental split of the former monolithic `index.ts`. Entry point remains `src/
 |-------|------|-----------------|
 | Pure | `memory/`, `text/`, `recall/math.ts`, `recall/rrf.ts` | `constants.ts` only |
 | Infra | `env.ts`, `constants.ts`, `lib/`, `db/` | pure, same layer |
-| Domain | `capture/`, `recall/`, `graph/`, `compression/`, `integrations/` | infra, pure, domain peers |
+| Domain | `capture/`, `recall/`, `graph/`, `compression/`, `integrations/`, `projects/` | infra, pure, domain peers |
 | Edge | `routes/`, `mcp/`, `oauth/` | domain, infra |
 | Entry | `index.ts` | edge only (+ wiring) |
 
@@ -38,11 +38,13 @@ Incremental split of the former monolithic `index.ts`. Entry point remains `src/
 | compression nightly/digest | `compression/*` |
 | staleness pass + classifier | `staleness/*` |
 | integration mirror | `integrations/mirror.ts` |
+| project registry, alias filter expansion, read-side resolution, auto-create | `projects/*` |
 | OAuth pages/register/authorize | `oauth/*` |
 | MCP server + sanitize | `mcp/*` |
 | REST routes | `routes/*` |
 | dbReady | `runtime/state.ts` |
 | maintenance workspace rotation | `runtime/rotation.ts` |
+| nightly summary written to KV for GET /stats/night | `runtime/night-summary.ts` |
 
 ## Tests
 

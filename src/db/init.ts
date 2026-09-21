@@ -128,6 +128,10 @@ const SCHEMA_OBJECTS: Record<string, string> = {
   idx_admin_events_created: `CREATE INDEX IF NOT EXISTS idx_admin_events_created ON admin_events(created_at DESC)`,
   // Single-row table driving the nightly round-robin over workspaces.
   maintenance_cursor: `CREATE TABLE IF NOT EXISTS maintenance_cursor (id INTEGER PRIMARY KEY CHECK (id = 1), workspace_id TEXT NOT NULL DEFAULT '', advanced_at INTEGER NOT NULL DEFAULT 0)`,
+  // Project registry. Additive: membership lives in entries.tags as project:<slug>, so old
+  // code ignores this table and rollback is a no-op. Never backfilled.
+  projects: `CREATE TABLE IF NOT EXISTS projects (id TEXT NOT NULL, workspace_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', aliases TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER, PRIMARY KEY (workspace_id, id))`,
+  idx_projects_workspace: `CREATE INDEX IF NOT EXISTS idx_projects_workspace ON projects(workspace_id, status)`,
 };
 
 /**
@@ -226,6 +230,9 @@ const ADMIN_EVENTS_COLUMNS: Record<string, string> = {
 const POST_COLUMN_OBJECTS: Record<string, string> = {
   idx_entries_capsule: `CREATE INDEX IF NOT EXISTS idx_entries_capsule ON entries(workspace_id, id) WHERE instr(lower(tags), '"capsule:') > 0`,
   idx_entries_workspace_created: `CREATE INDEX IF NOT EXISTS idx_entries_workspace_created ON entries(workspace_id, created_at DESC)`,
+  // Membership scans (GET /projects?counts=1) stay off ordinary memories. Post-column
+  // because workspace_id arrives by ALTER on older brains.
+  idx_entries_project: `CREATE INDEX IF NOT EXISTS idx_entries_project ON entries(workspace_id, id) WHERE instr(lower(tags), '"project:') > 0`,
   prompt_capsule_entry_insert: `CREATE TRIGGER IF NOT EXISTS prompt_capsule_entry_insert
     AFTER INSERT ON entries
     WHEN instr(lower(NEW.tags), '"capsule:') > 0 OR instr(lower(NEW.tags), '"capsule-slot:') > 0
@@ -265,11 +272,14 @@ const POST_COLUMN_OBJECTS: Record<string, string> = {
  * ALTER shows up immediately).
  * `kind` is what stops a name that appears on both sides from being read as the wrong one.
  *
- * This exists because the fifteen statements it replaces cost fifteen subrequests to
+ * This exists because the fifteen statements it replaces cost fifteen D1 calls to
  * discover that a migrated brain — which is every brain after its first request — needs
- * nothing done (#282). Free-plan invocations get 50 subrequests, ensureDbReady spends
- * them inside the request that triggered it, and GET /graph was already close enough to
- * the ceiling that a cold isolate pushed it over: 59 against a limit of 50, now 47.
+ * nothing done (#282). The free plan's actual ceiling is 1,000 D1/KV/Vectorize calls per
+ * invocation, but this codebase holds itself to a much tighter self-imposed D1 budget
+ * (~50 calls) per request for cost and 10 ms-CPU reasons, and ensureDbReady spends its
+ * share inside the request that triggered it: GET /graph was already close enough to
+ * that self-imposed budget that a cold isolate pushed it over — 59 against a target of
+ * 50, now 47.
  *
  * Cost is one subrequest and one row read per catalogue entry, flat in the number of
  * entries because neither side of the UNION touches table data — measured on real D1

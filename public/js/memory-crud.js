@@ -370,7 +370,11 @@ function renderViewTimeline(entry) {
   const el = document.getElementById('view-timeline')
   if (!el) return
   const items = entry.timeline || []
-  if (!items.length && !entry.actor_name) {
+  // A shared memory nobody has edited or appended yet still has a reason two
+  // buttons are greyed out, and that reason lives in this section, so an
+  // empty timeline hides History only when there is also no lock note to show.
+  const locked = entry.can_edit === false && !!entry.actor_name
+  if (!items.length && !locked) {
     el.style.display = 'none'
     el.innerHTML = ''
     return
@@ -387,7 +391,7 @@ function renderViewTimeline(entry) {
   }
   // Two greyed-out buttons with no explanation read as a broken screen, so the
   // reason sits at the end of the history that establishes it.
-  if (entry.can_edit === false && entry.actor_name) {
+  if (locked) {
     lines.push(`<div class="view-timeline-note">${escHtml(t('memories.authorLocked', { name: entry.actor_name }))}</div>`)
   }
   el.style.display = ''
@@ -471,8 +475,9 @@ function openView(entry, cardElement) {
   // below now states each one in words, and printing `volatility:state` beside
   // "Lifespan · Current" says the same thing twice, once unreadably.
   const viewTags = humanTags(entry.tags || [])
-  if (viewTags.length > 0) {
-    tagsContainer.innerHTML = viewTags.map((t) => `<span class="tag-chip">${escHtml(t)}</span>`).join('')
+  const viewProjects = projectChipsHtml(entry.tags || [])
+  if (viewProjects || viewTags.length > 0) {
+    tagsContainer.innerHTML = viewProjects + viewTags.map((t) => `<span class="tag-chip">${escHtml(t)}</span>`).join('')
   }
   const relatedEl = document.getElementById('view-related')
   relatedEl.style.display = 'none'
@@ -544,7 +549,7 @@ async function loadRelated(id, el) {
             const when = c.linkedAt
               ? ' · ' + formatDateUI(c.linkedAt, { year: 'numeric', month: 'short', day: 'numeric' })
               : ''
-            return `<div class="related-item" data-id="${escHtml(c.id)}" data-type="${escHtml(c.type)}"><button class="related-open"><span class="related-type">${escHtml(c.label)} · ${escHtml(who)}${escHtml(when)}</span>${escHtml((c.content || '').slice(0, 80))}</button><button class="related-unlink" title="${escAttr(t('memories.removeLink'))}"><i class="ti ti-unlink"></i></button></div>`
+            return `<div class="related-item" data-id="${escHtml(c.id)}" data-type="${escHtml(c.type)}"><button class="related-open"><span class="related-type">${escHtml(c.label)} · ${escHtml(who)}${escHtml(when)}</span>${escHtml((c.content || '').slice(0, 80))}</button><button class="related-unlink" aria-label="${escAttr(t('memories.removeLink'))}" title="${escAttr(t('memories.removeLink'))}"><i class="ti ti-unlink"></i></button></div>`
           },
         )
         .join('')

@@ -440,7 +440,14 @@ const SYSTEM_TAG_PREFIXES = [
   'stale:',
   'capsule:',
   'capsule-slot:',
+  'project:',
 ]
+
+/** Membership tag written on a memory that belongs to a project: `project:<slug>`. */
+const PROJECT_TAG_PREFIX = 'project:'
+
+/** Same grammar the Worker enforces (src/tags/system.ts PROJECT_SLUG_RE). */
+const PROJECT_SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
 /**
  * Bare markers the Worker writes: compression, pattern mining, dedupe, and the
@@ -495,6 +502,41 @@ function humanTags(tags) {
   return (Array.isArray(tags) ? tags : []).filter((t) => !isSystemTag(t))
 }
 
+/**
+ * The project slugs a memory belongs to, from its `project:<slug>` tags.
+ * Those tags are hidden from plain chips (see SYSTEM_TAG_PREFIXES); this is
+ * what the project chip and the graph clusterer read instead.
+ */
+function projectTagsOf(tags) {
+  const out = []
+  for (const tag of Array.isArray(tags) ? tags : []) {
+    if (typeof tag !== 'string') continue
+    const t = tag.trim().toLowerCase()
+    if (!t.startsWith(PROJECT_TAG_PREFIX)) continue
+    const slug = t.slice(PROJECT_TAG_PREFIX.length)
+    if (PROJECT_SLUG_RE.test(slug) && !out.includes(slug)) out.push(slug)
+  }
+  return out
+}
+
+/**
+ * Chips for the projects a memory belongs to, in place of the raw project: tags.
+ *
+ * Here rather than in js/projects.js because the card, the recall card, the
+ * detail sheet and the capture receipt all call it, and several of their tests
+ * load their own module without the Projects screen. The display name comes
+ * from projectName() when js/projects.js is loaded; otherwise the slug is the
+ * name, which is still a readable answer to "which project".
+ */
+function projectChipsHtml(tags) {
+  return projectTagsOf(tags)
+    .map((slug) => {
+      const name = typeof projectName === 'function' ? projectName(slug) : slug
+      return `<span class="tag-chip tag-chip--project" title="${escHtml(t('projects.chipTitle', { name }))}"><i class="ti ti-folder"></i>${escHtml(name)}</span>`
+    })
+    .join('')
+}
+
 /* ---- Graph view: topic clustering + static packed layout ------------------------------
  *
  * The dashboard graph groups memories into topic clusters derived from their tags, at two
@@ -535,6 +577,11 @@ const GRAPH_AXIS_TAGS = new Set([
  * structural fallback below. Without it, nodes tags cannot place stay loose.
  *
  * Rules (all thresholds scale with the store, so this works for small and large stores):
+ * - A `project:<slug>` tag is the person's own statement of what a memory is about, so it
+ *   decides the category outright (the first one, if there are several) before any
+ *   frequency reasoning, and is exempt from the tiny-category fold below: two memories
+ *   in a project are still a project. Project tags themselves are system tags, so they
+ *   never reach the sub-topic rule.
  * - System tags never define a cluster or a sub-topic: see isSystemTag. Entries
  *   *tagged* auto-pattern or synthesized never arrive here at all — the Worker leaves
  *   them out of the node set (src/graph/traverse.ts).
@@ -589,7 +636,15 @@ function assignGraphClusters(nodes, edges) {
   const distanceFromTarget = (d) => Math.abs(Math.log(d / TARGET_CLUSTER_SIZE));
 
   // Outer category per node.
+  const pinned = new Set();
   for (const n of nodes) {
+    // Said outright, so it outranks anything inferred from the other tags.
+    const project = projectTagsOf(n.tags)[0];
+    if (project) {
+      n.cluster = project;
+      pinned.add(n);
+      continue;
+    }
     const cands = [...new Set(candidateTags(n))];
     // Topic tags get first refusal; the axis tags are a fallback and never beat a
     // real topic. See GRAPH_AXIS_TAGS.
@@ -617,7 +672,7 @@ function assignGraphClusters(nodes, edges) {
   const csz = new Map();
   for (const n of nodes) csz.set(n.cluster, (csz.get(n.cluster) || 0) + 1);
   for (const n of nodes) {
-    if (SENTINELS.has(n.cluster) || csz.get(n.cluster) >= MIN_OUTER) continue;
+    if (SENTINELS.has(n.cluster) || pinned.has(n) || csz.get(n.cluster) >= MIN_OUTER) continue;
     let alt = null;
     let altSz = MIN_OUTER - 1;
     for (const t of new Set(candidateTags(n))) {
@@ -713,6 +768,24 @@ function assignGraphClusters(nodes, edges) {
     }
   }
   return nodes;
+}
+
+/**
+ * Narrows a graph to one author's nodes, pruning edges that no longer join two
+ * surviving nodes. Matches by actor_name (the server never puts actor_id on
+ * /graph nodes (src/graph/types.ts), only the resolved display name, the same
+ * "You" / real name / "Owner" / "Former member" string GET /list and GET
+ * /recall already print), so the caller has to resolve the selected filter's
+ * user id to that same name (loadGraph in graph-canvas.js does this) before
+ * calling in here. A falsy name is "no filter": returns the input unchanged.
+ */
+function filterGraphByActor(nodes, edges, name) {
+  if (!name) return { nodes, edges: edges || [] };
+  const kept = new Set((nodes || []).filter((n) => n.actor_name === name).map((n) => n.id));
+  return {
+    nodes: (nodes || []).filter((n) => kept.has(n.id)),
+    edges: (edges || []).filter((e) => kept.has(e.source) && kept.has(e.target)),
+  };
 }
 
 /* Phyllotaxis (sunflower) offsets for k node centers inside a disc of radius R.
@@ -893,5 +966,5 @@ if (typeof module !== 'undefined' && module.exports) {
   // downloadTextFile is deliberately absent: it needs a live URL and Blob, and
   // it is exercised through its two callers (exportMemories in js/settings.js
   // and exportActivityCsv in js/activity.js) rather than in isolation.
-  module.exports = { escHtml, escAttr, toDateStr, parseRecallResult, normalizeEntry, vectorizeHealthBanner, vectorizeBannerHtml, syncVectorizeBanner, workspaceFilterChip, syncWorkspaceFilterChip, isSystemTag, humanTags, assignGraphClusters, packGraphNodes, packGraphCircles, captureDefaultKey, csvCell, csvDocument, layerChipHtml };
+  module.exports = { escHtml, escAttr, toDateStr, parseRecallResult, normalizeEntry, vectorizeHealthBanner, vectorizeBannerHtml, syncVectorizeBanner, workspaceFilterChip, syncWorkspaceFilterChip, isSystemTag, humanTags, projectTagsOf, projectChipsHtml, assignGraphClusters, packGraphNodes, packGraphCircles, filterGraphByActor, captureDefaultKey, csvCell, csvDocument, layerChipHtml };
 }

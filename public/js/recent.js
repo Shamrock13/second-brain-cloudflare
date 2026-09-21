@@ -238,6 +238,7 @@ function confirmBulkLayerMove(target) {
     title: tPlural(`bulk.${sharing ? 'confirmShareTitle' : 'confirmPrivateTitle'}`, ids.length, { n: ids.length }),
     body: t(`bulk.${sharing ? 'confirmShareBody' : 'confirmPrivateBody'}`),
     confirmLabel: t(`bulk.${sharing ? 'shareAction' : 'privateAction'}`),
+    tone: 'primary',
     onConfirm: async (_checked, done, progress) => {
       bulkMoveInFlight = true
       // So the two actions behind the sheet are visibly held down for as long
@@ -394,7 +395,15 @@ async function loadRecent() {
   // so it is allowed to populate a moment late.
   maybeRevealActorFilter()
   try {
-    allEntries = await apiList(50, memoryLayerFilter, memoryActorFilter)
+    let listed = await apiList(50, memoryLayerFilter, memoryActorFilter, selectedTag, selectedProject)
+    // A project deleted since it was picked answers 404 with an error object.
+    // Showing everything is better than an error over a filter nobody can see.
+    if (selectedProject && !Array.isArray(listed)) {
+      selectedProject = ''
+      if (typeof loadComposerProjects === 'function') loadComposerProjects()
+      listed = await apiList(50, memoryLayerFilter, memoryActorFilter, selectedTag)
+    }
+    allEntries = listed
     // Through the filters, not straight to render: reloading used to reset the
     // list to everything while the filter controls still read "work" and
     // "past 7 days", which now happens after every capture rather than only
@@ -444,6 +453,7 @@ function onLayerFilterChange(value) {
 
 function onActorFilterChange(value) {
   memoryActorFilter = value || null
+  if (typeof loadGraph === 'function' && document.getElementById('mem-graph')?.style.display !== 'none') loadGraph()
   loadRecent()
 }
 
@@ -525,7 +535,11 @@ function renderRecent(entries) {
   renderBulkBar()
 }
 
-function makeRecentCard(entry) {
+/**
+ * One memory as a card. `selectable: false` is for lists that are not the
+ * Memories screen (a project's own), where selection mode has no bulk bar.
+ */
+function makeRecentCard(entry, { selectable = true } = {}) {
   let tags = []
   try {
     tags = JSON.parse(entry.tags || '[]')
@@ -570,10 +584,10 @@ function makeRecentCard(entry) {
   // expressions are the empty string and the card's markup is byte-identical
   // to what it was before multi-select existed — which is what keeps a solo
   // brain, and every card test written against it, untouched.
-  const selecting = TEAM_MODE && selectMode
+  const selecting = selectable && TEAM_MODE && selectMode
   const picked = selecting && selectedMemoryIds.has(entry.id)
   const selectBox = selecting
-    ? `<label class="card-select"><input type="checkbox" ${picked ? 'checked' : ''} onchange="toggleMemorySelection('${escAttr(entry.id)}', this.checked)" /></label>`
+    ? `<label class="card-select"><input type="checkbox" aria-label="${escAttr(t('memories.selectMemory', { title }))}" ${picked ? 'checked' : ''} onchange="toggleMemorySelection('${escAttr(entry.id)}', this.checked)" /></label>`
     : ''
   const card = document.createElement('div')
   card.className = 'memory-card' + (isSynthesized ? ' card--synthesized' : '') + (isRolledUp ? ' card--rolled-up' : '') + (isStale ? ' card--stale' : '') + (selecting ? ' memory-card--selecting' : '') + (picked ? ' memory-card--selected' : '')
@@ -590,7 +604,7 @@ function makeRecentCard(entry) {
     <span class="card-source"><i class="ti ${badge.icon}"></i>${escHtml(badge.label)}</span>
     ${created ? `<span class="card-time" title="${escAttr(new Date(created).toLocaleString(localeTag()))}">${escHtml(relativeTime(created))}</span>` : ''}
   </div>
-  <div class="card-tags">${shown.map((t) => `<span class="tag-chip">${escHtml(t)}</span>`).join('')}${layerChip}${vecChip}</div>
+  <div class="card-tags">${projectChipsHtml(tags)}${shown.map((t) => `<span class="tag-chip">${escHtml(t)}</span>`).join('')}${layerChip}${vecChip}</div>
   <div class="card-actions">
     <button class="card-action-btn append-btn" onclick="openAppend('${escAttr(entry.id)}', '${escAttr(entry.content.slice(0, 80))}')"><i class="ti ti-writing"></i> ${escHtml(t('memories.append'))}</button>
     <button class="card-action-btn edit-btn"><i class="ti ti-pencil"></i> ${escHtml(t('memories.edit'))}</button>

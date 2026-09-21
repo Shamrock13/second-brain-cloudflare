@@ -77,6 +77,14 @@ export interface IntegrationRecord {
   updatedAt: number;
 }
 
+// The one narrowing rule for a mirror layer, on both the read and write side:
+// anything that isn't the exact literal "company" is personal. Extracted so
+// every call site agrees by construction rather than by everyone typing the
+// same ternary — the divergence the union type otherwise can't catch.
+export function narrowMirrorLayer(value: unknown): "company" | "personal" {
+  return value === "company" ? "company" : "personal";
+}
+
 // Prefixed so integration keys coexist with workers-oauth-provider's own
 // token:/grant:/client: keys in the same namespace.
 const INTEGRATIONS_KEY_PREFIX = "integrations:";
@@ -105,8 +113,69 @@ export async function loadIntegration(env: IntegrationEnv, provider: string): Pr
   }
 }
 
+// Create-or-replace, for connect only — partial updates go through updateIntegration.
 export async function saveIntegration(env: IntegrationEnv, record: IntegrationRecord): Promise<void> {
   await env.OAUTH_KV.put(`${INTEGRATIONS_KEY_PREFIX}${record.provider}`, JSON.stringify(record));
+}
+
+// The ONLY way to update part of an existing record. Every writer that held a
+// record across awaited work and saved it back clobbered whatever landed in
+// between — a mid-sync layer change most damagingly (#348). Reading fresh at
+// save time shrinks the lost-update window from "the whole sync" to "the gap
+// between this read and this put"; KV has no compare-and-swap, so the gap
+// cannot be closed entirely, only made vanishingly small.
+export async function updateIntegration(
+  env: IntegrationEnv,
+  provider: string,
+  mutate: (record: IntegrationRecord) => void,
+): Promise<IntegrationRecord | null> {
+  const record = await loadIntegration(env, provider);
+  if (!record) return null;
+  mutate(record);
+  await saveIntegration(env, record);
+  return record;
+}
+
+// A sync's itemMap writes as deltas over its read snapshot (#348). The persisted
+// write is the deltas, applied to a freshly read record; `get` is the sync's
+// own working view (snapshot + earlier puts/deletes this run), which later
+// iterations need to see just as the old in-place writes let them — a repeated
+// key must update the mirror it just created, and a deleted one must not be
+// deleted twice. Record only successful operations.
+export class ItemMapDeltas {
+  // Item ids are arbitrary upstream strings, so nothing here may treat a plain
+  // object's inherited members ("constructor", "__proto__", ...) as entries:
+  // pending state is Map/Set, and the snapshot is read by own property only.
+  private puts = new Map<string, ItemMapEntry>();
+  private deletes = new Set<string>();
+
+  constructor(private snapshot: Record<string, ItemMapEntry>) {}
+
+  get(key: string): ItemMapEntry | undefined {
+    if (this.deletes.has(key)) return undefined;
+    const put = this.puts.get(key);
+    if (put) return put;
+    return Object.hasOwn(this.snapshot, key) ? this.snapshot[key] : undefined;
+  }
+
+  put(key: string, entry: ItemMapEntry): void {
+    this.deletes.delete(key);
+    this.puts.set(key, entry);
+  }
+
+  delete(key: string): void {
+    this.puts.delete(key);
+    this.deletes.add(key);
+  }
+
+  applyTo(itemMap: Record<string, ItemMapEntry>): void {
+    // defineProperty, not assignment: `itemMap["__proto__"] = x` would rewire
+    // the prototype instead of creating the key.
+    for (const [key, entry] of this.puts) {
+      Object.defineProperty(itemMap, key, { value: entry, enumerable: true, writable: true, configurable: true });
+    }
+    for (const key of this.deletes) delete itemMap[key];
+  }
 }
 
 export async function deleteIntegration(env: IntegrationEnv, provider: string): Promise<void> {
@@ -134,7 +203,7 @@ export function integrationStatus(
     // Record<string, unknown> escape hatch, and anything that is not "company"
     // is personal-by-default on the write path — so the readout has to agree
     // with the writer rather than with the blob.
-    mirrorWorkspace: record?.config?.mirrorWorkspace === "company" ? "company" : "personal",
+    mirrorWorkspace: narrowMirrorLayer(record?.config?.mirrorWorkspace),
     // The id, not the name. Resolving it needs D1 and the caller's own team
     // scope, neither of which this module has; the route swaps it for a name
     // and drops the id before the response leaves (src/routes/integrations.ts).
