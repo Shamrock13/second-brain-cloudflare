@@ -5,10 +5,14 @@
 
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import type { Env } from "./env";
+import { withFtsWriteGuard } from "./db/fts-write-guard";
 import { runNightlyCompression } from "./compression/nightly";
 import { runGraphPass } from "./graph/pass";
 import { INTEGRATION_SYNC_CRON, runScheduledIntegrationSync } from "./integrations/mirror";
+import { pushDueItemsAllWorkspaces } from "./push/send";
 import { runStalenessPass } from "./staleness/pass";
+import { runWhenExtractPass } from "./when/pass";
+import { runFtsMaintenance } from "./db/fts-backfill";
 import { nextWorkspace } from "./runtime/rotation";
 import { recordNightSummary } from "./runtime/night-summary";
 import { runInsightAccrual } from "./insight/candidates";
@@ -42,7 +46,13 @@ const oauthProvider = new OAuthProvider({
 });
 
 export default {
-  fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+  fetch: async (req: Request, rawEnv: Env, ctx: ExecutionContext) => {
+    // Every entries write in this Worker — capture, MCP remember/append/update/
+    // forget, the dashboard, integration mirroring, import — goes through this
+    // one env.DB, so guarding it here is the single choke point: a write that
+    // fails because entries_fts is missing or broken repairs it and retries
+    // once instead of 500ing (see src/db/fts-write-guard.ts).
+    const env = withFtsWriteGuard(rawEnv);
     const url = new URL(req.url);
     if (url.pathname === "/oauth/register" && req.method === "POST") {
       const augmented = await augmentOAuthRegistrationRequest(req);
@@ -50,7 +60,8 @@ export default {
     }
     return oauthProvider.fetch(req, env as any, ctx);
   },
-  scheduled: async (event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
+  scheduled: async (event: ScheduledEvent, rawEnv: Env, ctx: ExecutionContext) => {
+    const env = withFtsWriteGuard(rawEnv);
     // The jobs are independent, and each begins by awaiting the shared schema init. One
     // of them failing — including on that init — must not take the others down or surface
     // as an unhandled rejection inside waitUntil.
@@ -69,7 +80,22 @@ export default {
     // real — without the branch both triggers would run everything and the split would
     // cost CPU and D1-cost budget instead of buying it.
     if (event.cron === INTEGRATION_SYNC_CRON) {
-      job("integration sync", runScheduledIntegrationSync(env));
+      job("integration sync", (async () => {
+        try {
+          await runScheduledIntegrationSync(env);
+        } catch (e) {
+          console.error("integration sync failed (non-fatal):", e);
+        }
+        // Own try/catch, run after the sync regardless of whether it
+        // succeeded: due items reaching a subscribed device must not depend
+        // on the mirror sync's health, and a slow or failing sync must not
+        // delay notifications past the hour they were due.
+        try {
+          await pushDueItemsAllWorkspaces(env);
+        } catch (e) {
+          console.error("push due items failed (non-fatal):", e);
+        }
+      })());
       return;
     }
 
@@ -146,6 +172,13 @@ export default {
     // always 0 here: the weekly insight pass runs on its own cron trigger
     // (INSIGHT_WEEKLY_CRON / INSIGHT_TEAM_WEEKLY_CRON above) and never inside
     // this invocation.
+    //
+    // The when-extraction pass runs AFTER these three, not alongside them: it
+    // is capped at WHEN_EXTRACT_PER_NIGHT model calls and its own ten-D1-
+    // statement budget, on top of what compression/graph/staleness already
+    // spend, and keeping it sequential and separately caught means a slow or
+    // failing model call cannot delay or hide the other three the way
+    // bundling it into the same Promise.allSettled would.
     job("nightly maintenance", (async () => {
       const [compression, graph, staleness] = await Promise.allSettled([
         runNightlyCompression(env, ctx, slice),
@@ -155,6 +188,33 @@ export default {
       if (compression.status === "rejected") console.error("nightly compression failed (non-fatal):", compression.reason);
       if (graph.status === "rejected") console.error("graph pass failed (non-fatal):", graph.reason);
       if (staleness.status === "rejected") console.error("staleness pass failed (non-fatal):", staleness.reason);
+
+      let whenExtracted = 0;
+      let whenJudged = 0;
+      let whenSkipped = 0;
+      try {
+        const whenResult = await runWhenExtractPass(env, ctx, slice);
+        whenExtracted = whenResult.whenExtracted;
+        whenJudged = whenResult.whenJudged;
+        whenSkipped = whenResult.whenSkipped;
+        // The pass has already rolled its own cursor back when this is
+        // false (Finding 1) — logged here only so a real outage is visible
+        // in the tail, not to retry: retrying is what next night already does.
+        if (!whenResult.ok) console.error("when-extraction pass: batch write failed, cursor not advanced (non-fatal)");
+      } catch (e) {
+        console.error("when-extraction pass failed (non-fatal):", e);
+      }
+
+      // Same shape as the when pass: sequential and separately caught after
+      // the core three. An FTS failure here is non-fatal and recoverable —
+      // the nightly try/catch logs it, and whichever write hit the index
+      // first triggers its own repair — so it must not delay or hide the
+      // when counts or the night summary.
+      try {
+        await runFtsMaintenance(env);
+      } catch (e) {
+        console.error("FTS maintenance failed (non-fatal):", e);
+      }
 
       // No single workspace to attribute the summary to: an empty corpus (nothing
       // ran) or a rotation read failure (the passes fell back to a whole-corpus
@@ -171,6 +231,9 @@ export default {
         linksInferred: graph.status === "fulfilled" ? graph.value.inserted : 0,
         claimsFlagged: staleness.status === "fulfilled" ? staleness.value.flagged : 0,
         insightsProposed: 0,
+        whenExtracted,
+        whenJudged,
+        whenSkipped,
       });
     })());
   },
