@@ -1,5 +1,5 @@
 import type { Env } from "../env";
-import { FTS_BACKFILL_CURSOR_KV_KEY, FTS_READY_KV_KEY } from "../constants";
+import { FTS_BACKFILL_CURSOR_KV_KEY, FTS_READY_KV_KEY, VERSIONS_SINCE_KV_KEY } from "../constants";
 
 // The schema work below is idempotent but not free. All four nightly jobs run inside a
 // single scheduled() invocation and therefore share one subrequest budget, and each of
@@ -60,6 +60,7 @@ export function resetDatabaseInit(): void {
 // never partially applying, and is treated as a no-op rather than retried.
 export const ENTRIES_FTS_TABLE_DDL =
   `CREATE VIRTUAL TABLE entries_fts USING fts5(id UNINDEXED, content, tokenize='trigram')`;
+export const ENTRIES_FTS_VOCAB_DDL = `CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts_vocab USING fts5vocab(entries_fts, row)`;
 export const ENTRIES_FTS_INSERT_TRIGGER_DDL = `CREATE TRIGGER IF NOT EXISTS entries_fts_insert
     AFTER INSERT ON entries
     BEGIN
@@ -198,6 +199,24 @@ const SCHEMA_OBJECTS: Record<string, string> = {
   // is in entry_events' original CREATE, so it is present on every brain that
   // has the table at all and there is no ALTER to sequence behind.
   idx_entry_events_created: `CREATE INDEX IF NOT EXISTS idx_entry_events_created ON entry_events(created_at DESC)`,
+  // Cloud re-review MINOR (T-0102, on top of 0b970baa's R22 fix): brief/changes.ts's raw scan of
+  // this table is capped BEFORE any workspace/visibility filter can run (no workspace column to
+  // filter on without a join). A teammate's own ordinary burst, under a different actor_id, could
+  // fill that cap with noise and crowd the reader's own changes and held notices out of the window
+  // entirely. Reserving separate, index-backed scans for `actor_id = reader` and `event = 'held'`
+  // fixes that -- but only if each one is a genuine index range scan, not a full-table scan
+  // filtered in date order (which, with the reader's own matches sparse against the noise, would
+  // cost the same as no cap at all). Same table, same "busiest table in the schema" reasoning as
+  // idx_entry_events_created above; actor_id is in the original CREATE like created_at is.
+  idx_entry_events_actor: `CREATE INDEX IF NOT EXISTS idx_entry_events_actor ON entry_events(actor_id, created_at DESC)`,
+  // A partial index, sized to how many rows are ever actually held (rare, by construction -- a
+  // hold is an exceptional write, not a routine one), not to entry_events' total row count: cheap
+  // to maintain, and gives `WHERE event = 'held' ORDER BY created_at DESC LIMIT n` a direct,
+  // index-only seek regardless of how much non-held noise shares the same window.
+  idx_entry_events_held: `CREATE INDEX IF NOT EXISTS idx_entry_events_held ON entry_events(created_at DESC) WHERE event = 'held'`,
+  // The event readers' life-end subquery (quadratic in edits per memory without this index). No
+  // json_extract in the WHERE -- must never throw on a non-JSON payload; readers check trash=0 on top.
+  idx_entry_events_life_end: `CREATE INDEX IF NOT EXISTS idx_entry_events_life_end ON entry_events(entry_id) WHERE event IN ('purged', 'deleted')`,
   // Immutable administration audit trail. Same contract as entry_events:
   // application code only ever INSERTs here. Consumed by Phase 4.2.
   admin_events: `CREATE TABLE IF NOT EXISTS admin_events (id TEXT PRIMARY KEY, actor_id TEXT NOT NULL DEFAULT '', target_user_id TEXT NOT NULL DEFAULT '', workspace_id TEXT NOT NULL DEFAULT '', event TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL)`,
@@ -214,6 +233,24 @@ const SCHEMA_OBJECTS: Record<string, string> = {
   // device replaces rather than duplicates it.
   push_subscriptions: `CREATE TABLE IF NOT EXISTS push_subscriptions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT '', endpoint_hash TEXT NOT NULL, subscription_json TEXT NOT NULL, content_free INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_ok_at INTEGER, fail_count INTEGER NOT NULL DEFAULT 0, UNIQUE(endpoint_hash))`,
   idx_push_subscriptions_workspace: `CREATE INDEX IF NOT EXISTS idx_push_subscriptions_workspace ON push_subscriptions(workspace_id)`,
+  // Sampled recall log (T-0089.5.2 Part A). Additive, like push_subscriptions above: old
+  // code never reads this table and rollback is a no-op. Opt-in and sampled, so a brain
+  // that never turns RECALL_LOG on never writes a row here.
+  recall_log: `CREATE TABLE IF NOT EXISTS recall_log (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, created_at INTEGER NOT NULL, channel TEXT NOT NULL, query TEXT NOT NULL, params TEXT NOT NULL, returned_ids TEXT NOT NULL, followed_ids TEXT NOT NULL DEFAULT '[]')`,
+  idx_recall_log_ws: `CREATE INDEX IF NOT EXISTS idx_recall_log_ws ON recall_log(workspace_id, created_at DESC)`,
+  // Content history and soft delete (4.0). Additive: old code never reads either table,
+  // so rollback is a no-op. Never backfilled.
+  entry_versions: `CREATE TABLE IF NOT EXISTS entry_versions (id INTEGER PRIMARY KEY, entry_id TEXT NOT NULL, workspace_id TEXT NOT NULL DEFAULT '', seq INTEGER NOT NULL, content TEXT, prior_length INTEGER, prior_length_utf16 INTEGER, tags TEXT NOT NULL, state TEXT NOT NULL DEFAULT '{}', actor_id TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, meta TEXT NOT NULL DEFAULT '{}', valid_from INTEGER, created_at INTEGER NOT NULL, CHECK ((content IS NULL) <> (prior_length IS NULL)), CHECK (prior_length_utf16 IS NULL OR prior_length IS NOT NULL))`,
+  idx_entry_versions_entry: `CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_versions_entry ON entry_versions(entry_id, seq)`,
+  entries_trash: `CREATE TABLE IF NOT EXISTS entries_trash (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, row_json TEXT NOT NULL, edges_json TEXT NOT NULL DEFAULT '[]', vector_ids TEXT NOT NULL DEFAULT '[]', deleted_at INTEGER NOT NULL, deleted_by TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT 'forget', nonce TEXT NOT NULL DEFAULT '')`,
+  idx_entries_trash_deleted: `CREATE INDEX IF NOT EXISTS idx_entries_trash_deleted ON entries_trash(deleted_at)`,
+  // R5 (budget audit, MINOR): listTrash scopes by workspace_id and orders by deleted_at DESC;
+  // without this, SQLite's only path is the deleted_at index above, so it walks the whole trash
+  // table filtering every row for a workspace match — see db/schema.sql for the measured cost.
+  idx_entries_trash_workspace_deleted: `CREATE INDEX IF NOT EXISTS idx_entries_trash_workspace_deleted ON entries_trash(workspace_id, deleted_at DESC)`,
+  // Per-trigram document counts over entries_fts, read by distillation to price its df counts (src/recall/distill.ts).
+  // Stores nothing and resolves entries_fts by name at query time, so it may exist before, and survive a rebuild of, the index.
+  entries_fts_vocab: ENTRIES_FTS_VOCAB_DDL,
   // entries_fts and its three sync triggers are NOT here (v2.2 ownership
   // rule): they are created together, in one dedicated batch, below in
   // applySchema — never as independent SCHEMA_OBJECTS/POST_COLUMN_OBJECTS
@@ -265,6 +302,11 @@ const ENTRIES_COLUMNS: Record<string, string> = {
   // the first 80 characters of raw content. NULL on the explicit and regex
   // paths, which never generate one.
   when_label: `ALTER TABLE entries ADD COLUMN when_label TEXT`,
+  // Validity windows (T-0089.2.1). Never backfilled: readers coalesce valid_from to
+  // created_at and read a NULL valid_until as "still true". No index: every validity
+  // predicate runs on rows another predicate already selected.
+  valid_from: `ALTER TABLE entries ADD COLUMN valid_from INTEGER`,
+  valid_until: `ALTER TABLE entries ADD COLUMN valid_until INTEGER`,
 };
 
 /**
@@ -322,6 +364,31 @@ const ADMIN_EVENTS_COLUMNS: Record<string, string> = {
 };
 
 /**
+ * Columns added to `entry_versions` after the table shipped (T-0089.1.1, ADV-10).
+ *
+ * prior_length_utf16 lets a reconstruction skip scanning a delta row's base for the UTF-16 boundary
+ * `prior_length` (Unicode characters) points at, when the writer already had that boundary in JS and
+ * stamped it directly. A brain with rows from before this column existed just falls back to the scan
+ * for those — NULL is a valid, already-handled value, not a gap to backfill.
+ */
+const ENTRY_VERSIONS_COLUMNS: Record<string, string> = {
+  prior_length_utf16: `ALTER TABLE entry_versions ADD COLUMN prior_length_utf16 INTEGER`,
+};
+
+/**
+ * Columns added to `entries_trash` after the table shipped (T-0089.1.1, adv-final MAJAOR 1).
+ *
+ * nonce is a per-row identity independent of id and of SQLite's own reused rowid: additive,
+ * idempotent, never backfilled. A row already in the trash when this column arrives keeps
+ * reading '' forever — every trash mutation treats that as "cannot safely match this row",
+ * never as a value to match against, so an old row fails closed (conflict) instead of being
+ * silently trusted the way id or rowid alone were.
+ */
+const ENTRIES_TRASH_COLUMNS: Record<string, string> = {
+  nonce: `ALTER TABLE entries_trash ADD COLUMN nonce TEXT NOT NULL DEFAULT ''`,
+};
+
+/**
  * Objects that can only be built once the ALTERs above have run — an index over a
  * column that arrives via ALTER. These must NOT live in SCHEMA_OBJECTS: that loop
  * runs before the ALTERs on every pass, so on an upgraded brain (table exists,
@@ -335,6 +402,20 @@ const POST_COLUMN_OBJECTS: Record<string, string> = {
   // Membership scans (GET /projects?counts=1) stay off ordinary memories. Post-column
   // because workspace_id arrives by ALTER on older brains.
   idx_entries_project: `CREATE INDEX IF NOT EXISTS idx_entries_project ON entries(workspace_id, id) WHERE instr(lower(tags), '"project:') > 0`,
+  // Held draft digests (a digest stored because it contradicted a memory a system job may not rewrite):
+  // the nightly check for one reads only these rows. Post-column because workspace_id arrives by ALTER.
+  idx_entries_conflict_held: `CREATE INDEX IF NOT EXISTS idx_entries_conflict_held ON entries(workspace_id, id) WHERE instr(lower(tags), '"conflict-held"') > 0`,
+  // Agent brief queues (src/brief/compute.ts): each scans only its own rows instead of every
+  // memory. Each WHERE is the instr(...) form the brief queries repeat, so the planner can use it.
+  idx_entries_when: `CREATE INDEX IF NOT EXISTS idx_entries_when ON entries(workspace_id, when_at) WHERE when_at IS NOT NULL`,
+  idx_entries_task: `CREATE INDEX IF NOT EXISTS idx_entries_task ON entries(workspace_id, created_at) WHERE instr(lower(tags), '"task"') > 0`,
+  idx_entries_insight: `CREATE INDEX IF NOT EXISTS idx_entries_insight ON entries(workspace_id, created_at) WHERE instr(lower(tags), '"auto-insight"') > 0`,
+  idx_entries_stale: `CREATE INDEX IF NOT EXISTS idx_entries_stale ON entries(workspace_id, id) WHERE instr(lower(tags), '"stale:as-of"') > 0`,
+  // Track 7 (T-0089.7.1, T-0089.7.2): the decision log and standing-memory cache build each
+  // scan only their own marker. Post-column like the three above: workspace_id arrives by
+  // ALTER on older brains. Neither writes a row on upgrade — both tags are new.
+  idx_entries_ledger: `CREATE INDEX IF NOT EXISTS idx_entries_ledger ON entries(workspace_id, created_at) WHERE instr(lower(tags), '"ledger:decision"') > 0`,
+  idx_entries_standing: `CREATE INDEX IF NOT EXISTS idx_entries_standing ON entries(workspace_id, created_at) WHERE instr(lower(tags), '"standing:active"') > 0`,
   prompt_capsule_entry_insert: `CREATE TRIGGER IF NOT EXISTS prompt_capsule_entry_insert
     AFTER INSERT ON entries
     WHEN instr(lower(NEW.tags), '"capsule:') > 0 OR instr(lower(NEW.tags), '"capsule-slot:') > 0
@@ -372,41 +453,36 @@ const POST_COLUMN_OBJECTS: Record<string, string> = {
   // the nightly rebuildFtsIndex, not silently patched back in here.
 };
 
+// Tables the probe reads column sets for, each with the `kind` label its rows carry.
+// Bound as parameters so the SQL text stays fixed.
+const COLUMN_PROBE_TABLES = [
+  ["column", "entries"],
+  ["edge_column", "edges"],
+  ["user_column", "users"],
+  ["admin_event_column", "admin_events"],
+  ["entry_version_column", "entry_versions"],
+  ["entries_trash_column", "entries_trash"],
+] as const;
+
 /**
- * One statement that reports every schema object this file knows how to create: table,
- * index, and trigger names out of sqlite_master, and entries' columns out of the
- * table-valued form of PRAGMA table_info (SQLite rewrites neither list lazily — an
- * ALTER shows up immediately).
- * `kind` is what stops a name that appears on both sides from being read as the wrong one.
+ * One statement that reports every schema object this file creates: table, index and
+ * trigger names (with DDL) from sqlite_master, plus the columns of COLUMN_PROBE_TABLES via
+ * pragma_table_info. `kind` stops a name on both sides being read as the wrong one. It reads
+ * only the catalogue, never table data, so a migrated brain learns it needs nothing in one
+ * D1 call instead of fifteen (#282). A table that does not exist yet yields no column rows
+ * (absent = CREATE).
  *
- * This exists because the fifteen statements it replaces cost fifteen D1 calls to
- * discover that a migrated brain — which is every brain after its first request — needs
- * nothing done (#282). The free plan's actual ceiling is 1,000 D1/KV/Vectorize calls per
- * invocation, but this codebase holds itself to a much tighter self-imposed D1 budget
- * (~50 calls) per request for cost and 10 ms-CPU reasons, and ensureDbReady spends its
- * share inside the request that triggered it: GET /graph was already close enough to
- * that self-imposed budget that a cold isolate pushed it over — 59 against a target of
- * 50, now 47.
- *
- * Cost is one subrequest and one row read per catalogue entry, flat in the number of
- * entries because neither side of the UNION touches table data — measured on real D1
- * (workerd via Miniflare), not the mock, which is not something that can be re-verified
- * from a laptop. rows_read = 23 was that measurement, taken when SCHEMA_OBJECTS held
- * seven objects. It holds 26 now (team edition, projects, push subscriptions, and their
- * indexes all landed since), plus entries_fts, entry_counts, and their six triggers
- * (created outside SCHEMA_OBJECTS — see the ownership note above — but still read by
- * this same probe), so 23 is long stale and should be re-measured against a live
- * database rather than trusted as today's figure. What the measurement did establish,
- * and what still holds regardless of the exact count: it grows by one row per object
- * added to SCHEMA_OBJECTS, which is the cheap direction — adding a statement above now
- * costs one row here rather than one subrequest on every cold start.
+ * workerd caps a compound SELECT at 5 terms and a statement at 100 bound parameters. This is
+ * one CTE plus one UNION ALL (2 terms) with 12 binds. The 4.0.0 seven-arm form was rejected
+ * with "too many terms in compound SELECT", so the probe threw and every cold start
+ * re-applied the full schema. Guarded by test/unit/schema-probe-limits.test.ts.
  */
 const PROBE_SQL =
+  `WITH probe(kind, tbl) AS (VALUES ${COLUMN_PROBE_TABLES.map(() => "(?, ?)").join(",")}), ` +
+  `columns AS (SELECT p.kind AS kind, ti.name AS name FROM probe p CROSS JOIN pragma_table_info(p.tbl) ti) ` +
   `SELECT type AS kind, name, sql AS definition FROM sqlite_master WHERE type IN ('table','index','trigger') ` +
-  `UNION ALL SELECT 'column' AS kind, name, NULL AS definition FROM pragma_table_info('entries')` +
-  `UNION ALL SELECT 'edge_column' AS kind, name, NULL AS definition FROM pragma_table_info('edges')` +
-  `UNION ALL SELECT 'user_column' AS kind, name, NULL AS definition FROM pragma_table_info('users')` +
-  `UNION ALL SELECT 'admin_event_column' AS kind, name, NULL AS definition FROM pragma_table_info('admin_events')`;
+  `UNION ALL ` +
+  `SELECT kind, name, NULL AS definition FROM columns`;
 
 type ObjectKind = "table" | "index" | "trigger";
 /**
@@ -415,7 +491,7 @@ type ObjectKind = "table" | "index" | "trigger";
  * the name alone would let a user table called `idx_entries_source` stand in for the index,
  * which resolves init successfully and silently never creates it.
  */
-type ExistingSchema = { definitions: Map<string, string>; objects: Map<string, ObjectKind>; columns: Set<string>; edgeColumns: Set<string>; userColumns: Set<string>; adminEventColumns: Set<string> };
+type ExistingSchema = { definitions: Map<string, string>; objects: Map<string, ObjectKind>; columns: Set<string>; edgeColumns: Set<string>; userColumns: Set<string>; adminEventColumns: Set<string>; entryVersionColumns: Set<string>; entriesTrashColumns: Set<string> };
 
 /** Which kind of object a CREATE statement makes, so the probe can be asked about it. */
 const kindOf = (ddl: string): ObjectKind => {
@@ -446,9 +522,13 @@ const kindOf = (ddl: string): ObjectKind => {
 async function probeSchema(env: Env): Promise<ExistingSchema | null> {
   let rows: unknown;
   try {
-    rows = (await env.DB.prepare(PROBE_SQL).all<{ kind: string; name: string }>())?.results;
-  } catch {
-    console.warn("Schema probe failed; applying the full schema instead");
+    rows = (await env.DB.prepare(PROBE_SQL).bind(
+      // Two binds per probed table, in COLUMN_PROBE_TABLES order: the kind label, then
+      // the table name the CROSS JOIN resolves columns for.
+      ...COLUMN_PROBE_TABLES.flatMap(([kind, table]) => [kind, table]),
+    ).all<{ kind: string; name: string }>())?.results;
+  } catch (e) {
+    console.warn("Schema probe failed; applying the full schema instead:", e);
     return null;
   }
   if (!Array.isArray(rows)) return null;
@@ -459,18 +539,22 @@ async function probeSchema(env: Env): Promise<ExistingSchema | null> {
   const edgeColumns = new Set<string>();
   const userColumns = new Set<string>();
   const adminEventColumns = new Set<string>();
+  const entryVersionColumns = new Set<string>();
+  const entriesTrashColumns = new Set<string>();
   for (const row of rows as { kind?: unknown; name?: unknown; definition?: unknown }[]) {
     if (typeof row?.name !== "string") continue;
     if (row.kind === "column") columns.add(row.name);
     else if (row.kind === "edge_column") edgeColumns.add(row.name);
     else if (row.kind === "user_column") userColumns.add(row.name);
     else if (row.kind === "admin_event_column") adminEventColumns.add(row.name);
+    else if (row.kind === "entry_version_column") entryVersionColumns.add(row.name);
+    else if (row.kind === "entries_trash_column") entriesTrashColumns.add(row.name);
     else if (row.kind === "table" || row.kind === "index" || row.kind === "trigger") {
       objects.set(row.name, row.kind);
       if (typeof row.definition === "string") definitions.set(row.name, row.definition);
     }
   }
-  return { definitions, objects, columns, edgeColumns, userColumns, adminEventColumns };
+  return { definitions, objects, columns, edgeColumns, userColumns, adminEventColumns, entryVersionColumns, entriesTrashColumns };
 }
 
 /**
@@ -559,6 +643,16 @@ async function applySchema(env: Env): Promise<boolean> {
     // what it did before the probe existed.
     if (existing?.objects.get(name) === kindOf(ddl)) continue;
     await env.DB.exec(ddl);
+  }
+
+  // History starts when the table does. A failed probe (existing === null) is unknown, not
+  // proof the table is new, so it never writes the marker; getVersionsSince recovers instead.
+  if (existing !== null && existing.objects.get("entry_versions") !== "table") {
+    try {
+      await env.OAUTH_KV.put(VERSIONS_SINCE_KV_KEY, String(Date.now()));
+    } catch (e) {
+      console.error("versions:since write failed (non-fatal):", e);
+    }
   }
 
   // Ownership (v2.2): entries_fts and its three sync triggers are created
@@ -674,6 +768,22 @@ async function applySchema(env: Env): Promise<boolean> {
   }
   for (const [column, ddl] of Object.entries(ADMIN_EVENTS_COLUMNS)) {
     if (existing?.adminEventColumns.has(column)) continue;
+    try {
+      await env.DB.exec(ddl);
+    } catch (e) {
+      if (!isDuplicateColumn(e)) throw e;
+    }
+  }
+  for (const [column, ddl] of Object.entries(ENTRY_VERSIONS_COLUMNS)) {
+    if (existing?.entryVersionColumns.has(column)) continue;
+    try {
+      await env.DB.exec(ddl);
+    } catch (e) {
+      if (!isDuplicateColumn(e)) throw e;
+    }
+  }
+  for (const [column, ddl] of Object.entries(ENTRIES_TRASH_COLUMNS)) {
+    if (existing?.entriesTrashColumns.has(column)) continue;
     try {
       await env.DB.exec(ddl);
     } catch (e) {
